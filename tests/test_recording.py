@@ -39,13 +39,13 @@ class RecordingTests(unittest.TestCase):
                 self.assertGreater(len(data), 0)
                 self.assertGreater(np.max(np.abs(data[:, 0] - data[:, 1])), .01)
                 self.assertIn("saved", [e[0] for e in events[d.uid]])
-            self.assertTrue(json.loads((folder / "采集信息.json").read_text())["demo"])
+            self.assertTrue(json.loads((folder / "采集信息.json").read_text(encoding="utf-8"))["demo"])
 
     def test_no_password_in_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             d = Device("SSH", "SSH", password="secret-password")
             folder, _ = create_session(Path(tmp), "安全", [d], False)
-            self.assertNotIn("secret-password", (folder / "采集信息.json").read_text())
+            self.assertNotIn("secret-password", (folder / "采集信息.json").read_text(encoding="utf-8"))
             self.assertNotIn("password", d.public())
 
     def test_windows_safe_names(self):

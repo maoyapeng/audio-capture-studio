@@ -41,7 +41,7 @@ class UiTests(unittest.TestCase):
             window.stop_button.click()
             self.pump(.5)
             self.assertFalse(window.active)
-            data = json.loads((window.session_dir / "采集信息.json").read_text())
+            data = json.loads((window.session_dir / "采集信息.json").read_text(encoding="utf-8"))
             self.assertEqual(len(data["devices"]), 4)
             self.assertTrue(all(d["state"] == "已保存" for d in data["devices"].values()))
             self.assertEqual(len(list(window.session_dir.glob("*/audio.wav"))), 4)
