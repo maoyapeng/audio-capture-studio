@@ -127,6 +127,21 @@ class RecordingTests(unittest.TestCase):
             self.assertNotIn("saved", kinds)
             self.assertEqual(sf.info(Path(tmp) / "audio.wav").frames, 2400)
 
+    def test_stream_open_failure_never_reports_recording_started(self):
+        from types import SimpleNamespace
+        def fail(**kwargs):
+            raise RuntimeError("Invalid device")
+        with tempfile.TemporaryDirectory() as tmp:
+            events = []
+            worker = AudioWorker(Device("Realtek", "USB", rate=48000), Path(tmp), lambda *e: events.append(e))
+            with patch("audio_capture.audio.sd", SimpleNamespace(InputStream=fail)), patch("audio_capture.audio.max_usable_channels", return_value=2):
+                worker.run()
+            kinds = [kind for kind, _ in events]
+            self.assertNotIn("started", kinds)
+            self.assertNotIn("saved", kinds)
+            self.assertIn("finished", kinds)
+            self.assertTrue(any(kind == "error" and "48000 Hz" in data and "Invalid device" in data for kind, data in events))
+
 
 class FakeTransport:
     channels = 2

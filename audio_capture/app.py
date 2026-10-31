@@ -20,8 +20,8 @@ from PySide6.QtWidgets import (
     QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter, QVBoxLayout, QWidget,
 )
 
-from .audio import AudioWorker, scan_audio
-from .discovery import annotate_inputs, is_default_alias, preferred_host, windows_inventory
+from .audio import AudioWorker, LevelTestWorker, scan_audio
+from .discovery import annotate_inputs, is_default_alias, preferred_input_ids, windows_inventory
 from . import __version__
 from .models import Device, create_session, safe_name, save_manifest, timestamp
 from .remote import RemoteWorker, adb_devices, process_options
@@ -157,7 +157,7 @@ class DeviceDialog(QDialog):
             form.setRowVisible(self.port, False)
             self.channels.setEnabled(False)
             form.labelForField(self.channels).setText("最大输入通道数")
-            hint.setText("录制时启用设备最大输入通道数。独占模式需要 WASAPI 和硬件支持所选格式；失败不会回退共享模式。\n独占可绕过系统音频引擎，但不能保证关闭设备固件或驱动内的处理。")
+            hint.setText("多台设备可使用不同采样率，分别保存文件；不需要强制设为同一采样率。\n录制时启用设备最大输入通道数。独占模式需要 WASAPI 和硬件支持所选格式；失败不会回退共享模式。\n独占可绕过系统音频引擎，但不能保证关闭设备固件或驱动内的处理。")
             form.addRow(label(f"系统名称：{device.system_name}\n驱动接口：{device.host_api}\n"
                                f"硬件标识：{device.hardware_id or '未取得'}\n"
                                "同名设备尚不能可靠对应序列号，请用别名区分。", "muted"))
@@ -217,6 +217,7 @@ class MainWindow(QMainWindow):
         self._shown_uid = None
         self._meter_key = None
         self.active = set()
+        self.level_test = None
         self.session_dir = None
         self.manifest = None
         self.device_dirs = {}
@@ -278,12 +279,16 @@ class MainWindow(QMainWindow):
         side_header.addStretch()
         side_header.addWidget(self.count_label)
         side_layout.addLayout(side_header)
+        self.selected_only = QCheckBox("仅显示已勾选设备（精简列表）")
+        self.selected_only.setToolTip("关闭可查找和勾选其他设备；不会删除设备或改变录音选择。")
+        side_layout.addWidget(self.selected_only)
+        self.selected_only.toggled.connect(self.filter_changed)
         self.source_filter = QComboBox()
         self.source_filter.addItem("全部本地音频输入", "all")
         self.source_filter.addItem("仅已确认的 USB 输入", "usb")
         self.source_filter.setToolTip("远程设备始终显示；USB 分类来自 Windows 硬件信息。")
         self.host_filter = QComboBox()
-        self.host_filter.addItem("自动选择驱动（优先 WASAPI）", "")
+        self.host_filter.addItem("按设备自动选择驱动（优先 WASAPI）", "")
         self.host_filter.addItem("全部驱动接口（查找旧版可用输入）", "__all__")
         side_layout.addWidget(self.source_filter)
         side_layout.addWidget(self.host_filter)
@@ -301,7 +306,9 @@ class MainWindow(QMainWindow):
         side_layout.addWidget(self.device_list, 1)
         self.remove_button = button("移除选中设备", self.remove_device)
         side_layout.addWidget(self.remove_button)
-        info = label("☑ 勾选：参与本次录制\n蓝色高亮：仅查看设备详情\n找不到设备时可切换到全部本地音频。", "muted")
+        self.clear_selection_button = button("清空全部勾选", self.clear_selection)
+        side_layout.addWidget(self.clear_selection_button)
+        info = label("☑ 可勾选多台设备，一起开始和停止\n筛选不取消勾选，隐藏的已选设备也会录制。\n同一设备的多个驱动接口请只勾选一个。", "muted")
         info.setWordWrap(True)
         side_layout.addWidget(info)
         splitter.addWidget(side)
@@ -325,9 +332,10 @@ class MainWindow(QMainWindow):
         toolbar = QHBoxLayout()
         self.connect_button = button("连接终端", self.connect_device)
         self.config_button = button("设备配置", self.configure)
+        self.test_button = button("测试音量", self.toggle_level_test)
         self.retry_button = button("重试取回文件", self.retry_download)
         self.clear_button = button("清空显示", self.clear_log)
-        for w in (self.connect_button, self.config_button, self.retry_button, self.clear_button):
+        for w in (self.connect_button, self.config_button, self.test_button, self.retry_button, self.clear_button):
             toolbar.addWidget(w)
         toolbar.addStretch()
         detail_layout.addLayout(toolbar)
@@ -407,6 +415,9 @@ class MainWindow(QMainWindow):
         self.browse_button = button("浏览…", self.browse)
         settings.addWidget(self.browse_button)
         outer.addLayout(settings)
+        self.selection_summary = label("", "muted")
+        self.selection_summary.setWordWrap(True)
+        outer.addWidget(self.selection_summary)
         transport = QHBoxLayout()
         self.clock = label("00:00:00", "time")
         self.record_state = label("准备就绪", "muted")
@@ -444,6 +455,9 @@ class MainWindow(QMainWindow):
                 d.available = False if d.kind == "USB" else True
                 self.states[d.uid] = "待发现" if d.kind == "USB" else "未连接"
             self.destination.setText(data.get("destination", self.destination.text()))
+            self.selected_only.blockSignals(True)
+            self.selected_only.setChecked(data.get("selected_only", any(d.selected for d in self.devices)))
+            self.selected_only.blockSignals(False)
         except Exception as exc:
             QMessageBox.warning(self, "读取配置失败", str(exc))
 
@@ -451,7 +465,8 @@ class MainWindow(QMainWindow):
         if self.demo:
             return
         try:
-            data = {"devices": [d.public() for d in self.devices], "destination": self.destination.text()}
+            data = {"devices": [d.public() for d in self.devices], "destination": self.destination.text(),
+                    "selected_only": self.selected_only.isChecked()}
             temp = self.config_path.with_suffix(".tmp")
             temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             temp.replace(self.config_path)
@@ -463,25 +478,44 @@ class MainWindow(QMainWindow):
         return next((d for d in self.devices if item and d.uid == item.data(Qt.UserRole)), None)
 
     def active_host(self):
-        hosts = list(dict.fromkeys(d.host_api for d in self.devices if d.kind == "USB" and d.available))
-        return self.host_filter.currentData() or preferred_host(hosts)
+        return self.host_filter.currentData() or ""
 
     def visible_devices(self):
+        if self.selected_only.isChecked():
+            return [d for d in self.devices if d.selected]
         host = self.active_host()
+        automatic = preferred_input_ids(self.devices) if not host else set()
         usb_only = self.source_filter.currentData() == "usb"
         return [d for d in self.devices if d.kind != "USB" or (
-            (host == "__all__" or (d.host_api == host and not is_default_alias(d.system_name or d.name)))
+            (host == "__all__" or (not host and d.uid in automatic) or
+             (host and d.host_api == host and not is_default_alias(d.system_name or d.name)))
             and (not usb_only or d.bus == "usb"))]
 
     def filter_changed(self, *_):
         if self.active:
             return
-        visible = {d.uid for d in self.visible_devices()}
-        for d in self.devices:
-            if d.uid not in visible:
-                d.selected = False
         self.refresh_list()
         self.save_config()
+
+    def clear_selection(self):
+        if self.active:
+            return
+        for device in self.devices:
+            device.selected = False
+        self.selected_only.blockSignals(True)
+        self.selected_only.setChecked(False)
+        self.selected_only.blockSignals(False)
+        self.refresh_list()
+        self.save_config()
+
+    def update_selection_summary(self):
+        selected = [d for d in self.devices if d.selected]
+        visible = {d.uid for d in self.visible_devices()}
+        hidden = sum(d.uid not in visible for d in selected)
+        self.count_label.setText(f"已选 {len(selected)} 台" + (f" · 隐藏 {hidden}" if hidden else ""))
+        names = [f"{d.name}（{d.channels} 通道 / {d.host_api or d.kind}）" for d in selected]
+        self.selection_summary.setText("本次录制：" + ("；".join(names) if names else "请勾选需要同时录制的设备"))
+        self.start_button.setText(f"● 开始录制（{len(selected)} 台）")
 
     @staticmethod
     def device_type(d):
@@ -490,6 +524,8 @@ class MainWindow(QMainWindow):
         return {"usb": "USB", "bluetooth": "蓝牙", "other": "本地音频"}.get(d.bus, "本地音频 · 类型待确认")
 
     def refresh_list(self):
+        self.source_filter.setVisible(not self.selected_only.isChecked())
+        self.host_filter.setVisible(not self.selected_only.isChecked())
         previous = self.current_device()
         scroll = self.device_list.verticalScrollBar().value()
         self.device_list.blockSignals(True)
@@ -517,20 +553,23 @@ class MainWindow(QMainWindow):
         self.device_list.setCurrentItem(current_item or self.device_list.item(0))
         self.device_list.verticalScrollBar().setValue(scroll)
         self.device_list.blockSignals(False)
-        self.count_label.setText(f"勾选 {sum(d.selected for d in visible)} / {len(visible)}")
+        self.update_selection_summary()
         local_count = sum(d.kind == "USB" and d.available for d in visible)
         self.discovery_hint.setText(
-            f"显示 {local_count} 个音频输入 · {('全部驱动接口' if self.active_host() == '__all__' else self.active_host()) or '暂无音频驱动'}"
+            f"显示 {local_count} 个音频输入 · {('全部驱动接口' if self.active_host() == '__all__' else self.active_host()) or '按设备自动选择驱动'}"
             if local_count else "未发现符合筛选的音频输入。可刷新，或切换到全部本地音频。")
+        if self.selected_only.isChecked():
+            self.discovery_hint.setText(f"本次录制 {len(visible)} 台设备；取消上方精简选项可添加设备。")
         self.show_current()
 
     def selection_changed(self, item):
         d = next(d for d in self.devices if d.uid == item.data(Qt.UserRole))
         d.selected = item.checkState() == Qt.Checked
-        visible = self.visible_devices()
-        self.count_label.setText(f"勾选 {sum(d.selected for d in visible)} / {len(visible)}")
+        self.update_selection_summary()
         self.show_current()
         self.save_config()
+        if self.selected_only.isChecked():
+            self.refresh_list()
 
     def update_detail_visibility(self, *_):
         d = self.current_device()
@@ -547,6 +586,7 @@ class MainWindow(QMainWindow):
         self.retry_button.setVisible(remote)
         self.clear_button.setVisible(show_log)
         self.config_button.setVisible(bool(d))
+        self.test_button.setVisible(local)
 
     def show_current(self, *_):
         d = self.current_device()
@@ -603,9 +643,35 @@ class MainWindow(QMainWindow):
         self.command.setEnabled(remote and connected)
         self.send_button.setEnabled(remote and connected)
         self.interrupt_button.setEnabled(remote and connected)
-        self.config_button.setEnabled(not self.active)
+        self.config_button.setEnabled(not self.active and self.level_test is None)
+        testing = self.level_test is not None
+        self.test_button.setText("停止音量测试" if testing else "测试音量")
+        self.test_button.setEnabled(not self.active and not self.scan_busy and (testing or d.available or self.demo))
+        if testing:
+            self.local_hint.setText(f"正在测试：{self.level_test.device.name}（不保存音频）。选择该设备查看电平。")
+        elif not self.active:
+            self.local_hint.setText("点击“测试音量”查看各通道电平，不保存录音文件。")
         self.retry_button.setEnabled(remote and connected and not self.active and d.uid in self.device_dirs)
-        self.remove_button.setEnabled(not self.active and (not worker or not worker.is_alive()))
+        self.remove_button.setEnabled(not self.active and not testing and (not worker or not worker.is_alive()))
+        self.update_detail_visibility()
+
+    def toggle_level_test(self):
+        if self.level_test is not None:
+            self.level_test.stop()
+            self.test_button.setEnabled(False)
+            self.test_button.setText("正在停止测试…")
+            return
+        d = self.current_device()
+        if not d or d.kind != "USB" or self.active or self.scan_busy:
+            return
+        self.last_levels[d.uid] = [0.0] * d.channels
+        self.paint_levels(d.uid)
+        self.level_test = LevelTestWorker(replace(d),
+            lambda kind, data, uid=d.uid: self.bridge.event.emit(uid, "test_" + kind, data), self.demo)
+        self.start_button.setEnabled(False)
+        self.refresh_button.setEnabled(False)
+        self.level_test.start()
+        self.show_current()
         self.update_detail_visibility()
 
     def paint_levels(self, uid):
@@ -617,7 +683,7 @@ class MainWindow(QMainWindow):
                 text.setText(f"CH {i + 1:02d}   {db:.1f} dBFS")
 
     def discover(self, force=False):
-        if self.demo or self.active or self.scan_busy:
+        if self.demo or self.active or self.scan_busy or self.level_test is not None:
             return
         self.scan_busy = True
         self.refresh_button.setEnabled(False)
@@ -680,7 +746,7 @@ class MainWindow(QMainWindow):
                 d = matches[ordinal]
             else:
                 d = Device(a["name"], "USB", channels=a["channels"], system_name=a["name"], host_api=a["host"],
-                           selected=False)
+                           selected=False, rate=int(a.get("default_rate", 48000)))
                 self.devices.append(d)
             d.audio_index, d.channels, d.available = a["index"], a["channels"], True
             d.system_name = a["name"]
@@ -698,7 +764,7 @@ class MainWindow(QMainWindow):
         chosen = self.host_filter.currentData()
         self.host_filter.blockSignals(True)
         self.host_filter.clear()
-        self.host_filter.addItem("自动选择驱动（优先 WASAPI）", "")
+        self.host_filter.addItem("按设备自动选择驱动（优先 WASAPI）", "")
         self.host_filter.addItem("全部驱动接口（查找旧版可用输入）", "__all__")
         for host in dict.fromkeys(d.host_api for d in self.devices if d.kind == "USB" and d.available):
             self.host_filter.addItem(host, host)
@@ -790,9 +856,9 @@ class MainWindow(QMainWindow):
             self.save_config()
 
     def start_recording(self):
-        if self.active or self.scan_busy:
+        if self.active or self.scan_busy or self.level_test is not None:
             return
-        selected = [d for d in self.visible_devices() if d.selected]
+        selected = [d for d in self.devices if d.selected]
         if not selected:
             QMessageBox.information(self, "选择设备", "请至少勾选一台设备。")
             return
@@ -830,6 +896,7 @@ class MainWindow(QMainWindow):
             return
         self.active = {d.uid for d in selected}
         self.started_monotonic = time.monotonic()
+        self.clock.setText("00:00:00")
         self.record_state.setText("演示采集中" if self.demo else "正在采集")
         self.output_label.setText(str(self.session_dir) + "\n" + " · ".join(f"{d.name} / {d.channels}ch" for d in selected))
         self.set_recording_ui(True)
@@ -856,7 +923,7 @@ class MainWindow(QMainWindow):
 
     def set_recording_ui(self, recording):
         for widget in (self.start_button, self.add_button, self.refresh_button, self.task, self.destination,
-                       self.browse_button, self.source_filter, self.host_filter):
+                       self.browse_button, self.source_filter, self.host_filter, self.clear_selection_button, self.selected_only):
             widget.setEnabled(not recording)
         self.stop_button.setEnabled(recording)
         self.refresh_list()
@@ -890,6 +957,25 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(f"日志写入失败：{exc}")
 
     def handle_event(self, uid, kind, data):
+        if kind.startswith("test_"):
+            if kind == "test_levels":
+                self.last_levels[uid] = data
+                if self.current_device() and self.current_device().uid == uid:
+                    self.paint_levels(uid)
+            elif kind in ("test_error", "test_log"):
+                self.append_log(uid, str(data) + "\n")
+                if kind == "test_error":
+                    self.statusBar().showMessage(str(data))
+                    self.log_toggle.setChecked(True)
+            elif kind == "test_finished":
+                self.level_test = None
+                self.last_levels[uid] = [0.0] * len(self.last_levels.get(uid, []))
+                if self.current_device() and self.current_device().uid == uid:
+                    self.paint_levels(uid)
+                self.start_button.setEnabled(True)
+                self.refresh_button.setEnabled(True)
+                self.show_current()
+            return
         if kind == "discovery":
             self._discovered(data)
             return
@@ -999,6 +1085,11 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 
     def closeEvent(self, event):
+        if self.level_test is not None:
+            self.level_test.stop()
+            event.ignore()
+            QTimer.singleShot(200, self.close)
+            return
         if self.active:
             QMessageBox.information(self, "仍在采集", "请先停止并等待各设备保存或取回文件，再关闭窗口。")
             event.ignore()

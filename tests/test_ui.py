@@ -5,6 +5,8 @@ import time
 import unittest
 from pathlib import Path
 
+import soundfile as sf
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
@@ -50,6 +52,25 @@ class UiTests(unittest.TestCase):
             self.assertFalse(window.stop_button.isEnabled())
             window.close()
             self.pump(.05)
+
+    def test_level_preview_updates_meters_without_creating_recording(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            window = MainWindow(demo=True, config_dir=Path(tmp) / "config")
+            window.scan_timer.stop()
+            window.destination.setText(str(Path(tmp) / "recordings"))
+            window.test_button.click()
+            self.pump(.25)
+            self.assertIsNotNone(window.level_test)
+            self.assertGreater(window.meters[0][0].value(), 0)
+            self.assertFalse(window.start_button.isEnabled())
+            self.assertIsNone(window.session_dir)
+            self.assertFalse((Path(tmp) / "recordings").exists())
+            window.test_button.click()
+            self.pump(.3)
+            self.assertIsNone(window.level_test)
+            self.assertTrue(window.start_button.isEnabled())
+            self.assertEqual(window.meters[0][0].value(), 0)
+            window.close()
 
     def test_only_confirmed_usb_and_one_driver_are_visible(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -106,6 +127,47 @@ class UiTests(unittest.TestCase):
             self.assertTrue(window.terminal.isVisible())
             self.assertTrue(window.command_widget.isVisible())
             self.assertFalse(window.meter_area.isVisible())
+            window.close()
+
+    def test_devices_on_different_drivers_record_together_after_filter_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            window = MainWindow(demo=True, config_dir=Path(tmp) / "config")
+            window.scan_timer.stop()
+            window.devices = []
+            window._discovered(dict(audio=[
+                dict(index=1, name="Nine channels", host="Windows WASAPI", channels=9, bus="usb", default_rate=16000),
+                dict(index=2, name="Stereo", host="MME", channels=2, bus="unknown"),
+            ], adb=[], errors=[]))
+            self.assertEqual(window.device_list.count(), 2)
+            self.assertEqual(window.devices[0].rate, 16000)
+            window.devices[0].rate = 32000
+            window.refresh_list()
+            self.assertEqual(window.devices[0].rate, 32000)
+            for device in window.devices:
+                device.selected = True
+            window.host_filter.setCurrentIndex(window.host_filter.findData("MME"))
+            self.assertEqual(window.device_list.count(), 1)
+            self.assertTrue(all(d.selected for d in window.devices))
+            self.assertIn("隐藏 1", window.count_label.text())
+            self.assertIn("Nine channels", window.selection_summary.text())
+            self.assertIn("Stereo", window.selection_summary.text())
+            window.destination.setText(str(Path(tmp) / "recordings"))
+            window.start_button.click()
+            self.pump(.25)
+            self.assertEqual(len(window.active), 2)
+            self.assertFalse(window.clear_selection_button.isEnabled())
+            window.stop_button.click()
+            self.pump(.5)
+            self.assertFalse(window.active)
+            records = json.loads((window.session_dir / "采集信息.json").read_text(encoding="utf-8"))["devices"]
+            self.assertEqual(len(records), 2)
+            for record in records.values():
+                self.assertEqual(record["state"], "已保存")
+                info = sf.info(record["file"])
+                self.assertEqual(info.channels, record["device"]["channels"])
+                self.assertGreater(info.frames, 0)
+            window.clear_selection_button.click()
+            self.assertFalse(any(d.selected for d in window.devices))
             window.close()
 
 

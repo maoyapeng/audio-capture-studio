@@ -10,6 +10,8 @@ import json
 import os
 import subprocess
 
+from .models import Device
+
 
 WINDOWS_INVENTORY = r"""
 $ErrorActionPreference = 'Stop'
@@ -103,6 +105,31 @@ def preferred_host(hosts: list[str]) -> str:
             if keyword.casefold() in host.casefold():
                 return host
     return hosts[0]
+
+
+def preferred_input_ids(devices: list[Device]) -> set[str]:
+    """Choose a driver per endpoint, keeping ambiguous input groups visible."""
+    groups: dict[tuple[str, str], list[Device]] = {}
+    for device in devices:
+        if device.kind != "USB" or is_default_alias(device.system_name or device.name):
+            continue
+        key = ("endpoint", device.endpoint_id) if device.endpoint_id else (
+            "name", name_key(device.system_name or device.name))
+        groups.setdefault(key, []).append(device)
+    visible = set()
+    for group in groups.values():
+        available = [d for d in group if d.available] or group
+        hosts: dict[str, list[Device]] = {}
+        for device in available:
+            hosts.setdefault(device.host_api, []).append(device)
+        # Unequal counts can represent different same-name physical devices.
+        # Without endpoint IDs, do not hide an unmatched input by guessing.
+        if not group[0].endpoint_id and len({len(items) for items in hosts.values()}) > 1:
+            visible.update(d.uid for d in available)
+        else:
+            visible.update(d.uid for d in hosts[preferred_host(list(hosts))])
+        visible.update(d.uid for d in group if d.selected)
+    return visible
 
 
 def is_default_alias(name: str) -> bool:

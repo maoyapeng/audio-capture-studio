@@ -25,7 +25,7 @@ def scan_audio(reinitialize: bool = False) -> list[dict]:
         sd._initialize()
     hosts = sd.query_hostapis()
     return [dict(index=i, name=d["name"], channels=int(d["max_input_channels"]),
-                 host=hosts[d["hostapi"]]["name"])
+                 host=hosts[d["hostapi"]]["name"], default_rate=int(d["default_samplerate"]))
             for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0]
 
 
@@ -62,6 +62,7 @@ class AudioWorker(threading.Thread):
         self.overflows = 0
         self.frames = 0
         self.stream = None
+
         self.last_callback = 0.0
 
     def stop(self):
@@ -78,10 +79,10 @@ class AudioWorker(threading.Thread):
             # RF64 is WAV-compatible and supports files larger than 4 GiB.
             with sf.SoundFile(path, mode="w", samplerate=d.rate, channels=d.channels,
                               subtype=f"PCM_{d.bits}", format="RF64") as output:
-                self.emit("started", {"started_at": timestamp(), "channels": d.channels, "file": str(path)})
                 self.emit("log", "演示信号开始（非麦克风数据）" if self.demo else
                           f"正在打开音频流：{d.system_name or d.name} / {d.host_api} / {d.capture_mode}；软件不做降噪、增益或混音")
                 if self.demo:
+                    self._emit_started()
                     self._demo(output)
                 else:
                     self._record(output)
@@ -100,9 +101,14 @@ class AudioWorker(threading.Thread):
             else:
                 self.emit("saved", result)
         except Exception as exc:
-            self.emit("error", str(exc))
+            self.emit("error", f"{d.name} / {d.host_api} / {d.channels} 通道 / {d.rate} Hz：{exc}。"
+                      " 请检查采样率、设备连接、Windows 麦克风权限及是否被其他程序独占。")
         finally:
             self.emit("finished", {})
+
+    def _emit_started(self):
+        self.emit("started", {"started_at": timestamp(), "channels": self.device.channels,
+                              "file": str(self.directory / "audio.wav")})
 
     def _demo(self, output):
         d = self.device
@@ -138,6 +144,7 @@ class AudioWorker(threading.Thread):
                             dtype="float32", blocksize=0,
                             callback=callback, **stream_options(d)) as stream:
             self.stream = stream
+            self._emit_started()
             self.emit("log", f"采集中：{d.channels} 通道 / {d.rate} Hz / {d.bits} bit")
             last_meter = 0.0
             while not self.stop_event.is_set() and not self.fatal.is_set():
@@ -158,3 +165,33 @@ class AudioWorker(threading.Thread):
                 output.write(data)
                 self.frames += len(data)
         self.stream = None
+
+class LevelTestWorker(AudioWorker):
+    """Use the recording input path, discarding samples instead of writing files."""
+
+    def __init__(self, device, emit, demo=False):
+        super().__init__(device, Path(), emit, demo)
+
+    def _emit_started(self):
+        self.emit("started", {})
+
+    def run(self):
+        class Discard:
+            def write(self, data):
+                pass
+
+        try:
+            if self.demo:
+                self._emit_started()
+                self._demo(Discard())
+            else:
+                count = max_usable_channels(self.device)
+                if count != self.device.channels:
+                    raise RuntimeError(f"当前格式仅支持 {count} 通道，请调整采样率或驱动接口")
+                self._record(Discard())
+                if self.fatal.is_set():
+                    raise RuntimeError("音频输入中断或缓冲溢出，请检查设备连接")
+        except Exception as exc:
+            self.emit("error", f"音量测试失败：{self.device.name} / {self.device.rate} Hz：{exc}")
+        finally:
+            self.emit("finished", {})

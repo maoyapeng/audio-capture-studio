@@ -3,7 +3,8 @@ import unittest
 import subprocess
 from unittest.mock import patch
 
-from audio_capture.discovery import annotate_inputs, is_default_alias, preferred_host, windows_inventory
+from audio_capture.discovery import annotate_inputs, is_default_alias, preferred_host, preferred_input_ids, windows_inventory
+from audio_capture.models import Device
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -44,6 +45,33 @@ class DiscoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "硬件查询超时") as error:
                 windows_inventory()
             self.assertNotIn("encoded", str(error.exception))
+
+    def test_automatic_driver_keeps_inputs_only_exposed_by_other_hosts(self):
+        devices = [
+            Device("Multi", "USB", host_api="Windows WASAPI", channels=9, selected=False),
+            Device("Multi", "USB", host_api="MME", channels=9, selected=False),
+            Device("Stereo", "USB", host_api="MME", channels=2, selected=False),
+        ]
+        self.assertEqual(preferred_input_ids(devices), {devices[0].uid, devices[2].uid})
+
+    def test_same_name_physical_endpoints_are_not_hidden(self):
+        devices = [
+            Device("Mic", "USB", host_api="Windows WASAPI", endpoint_id="first", selected=False),
+            Device("Mic", "USB", host_api="MME", endpoint_id="second", selected=False),
+        ]
+        self.assertEqual(preferred_input_ids(devices), {d.uid for d in devices})
+        # No identities and unequal interface counts: preserve ambiguous inputs.
+        for device in devices:
+            device.endpoint_id = ""
+        devices.append(Device("Mic", "USB", host_api="MME", selected=False))
+        self.assertEqual(preferred_input_ids(devices), {d.uid for d in devices})
+
+    def test_driver_fallback_keeps_selected_disconnected_input_visible(self):
+        devices = [
+            Device("Mic", "USB", host_api="Windows WASAPI", available=False, selected=True),
+            Device("Mic", "USB", host_api="MME", selected=False),
+        ]
+        self.assertEqual(preferred_input_ids(devices), {d.uid for d in devices})
 
     @unittest.skipUnless(os.name == "nt", "Windows PnP integration")
     def test_windows_inventory_command_executes(self):
