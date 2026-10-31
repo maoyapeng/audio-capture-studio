@@ -17,10 +17,12 @@ from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog,
     QFormLayout, QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit,
-    QProgressBar, QPushButton, QScrollArea, QSpinBox, QSplitter, QVBoxLayout, QWidget,
+    QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QSplitter, QVBoxLayout, QWidget,
 )
 
 from .audio import AudioWorker, scan_audio
+from .discovery import annotate_inputs, is_default_alias, preferred_host, windows_inventory
+from . import __version__
 from .models import Device, create_session, safe_name, save_manifest, timestamp
 from .remote import RemoteWorker, adb_devices, process_options
 
@@ -40,7 +42,7 @@ QPushButton#primary {background:#245fd3; color:white; border:0; font-weight:600;
 QPushButton#primary:disabled {background:#aabbd8;}
 QLineEdit, QComboBox, QSpinBox {background:white; border:1px solid #d6dfeb; border-radius:4px; padding:6px; color:#253349;}
 QListWidget {background:white; border:0; outline:0; padding:5px;}
-QListWidget::item {padding:12px 7px; border-bottom:1px solid #edf0f6; border-radius:4px;}
+QListWidget::item {padding:10px 7px; border-bottom:1px solid #edf0f6; border-radius:4px;}
 QListWidget::item:selected {background:#eaf1ff; color:#253349;}
 QPlainTextEdit {background:#152031; color:#d8e6f8; border:0; border-radius:5px; padding:12px; font-family:Consolas,'Microsoft YaHei'; font-size:12px;}
 QProgressBar {background:#eef2f7; border:0; border-radius:3px; height:10px; text-align:center;}
@@ -140,13 +142,19 @@ class DeviceDialog(QDialog):
         hint.setWordWrap(True)
         form.addRow(hint)
         if device and device.kind == "USB":
+            self.kind.setItemText(0, "本地音频")
             for key in self.fields:
                 if key not in ("name",):
                     self.fields[key].setEnabled(False)
+                    form.setRowVisible(self.fields[key], False)
             self.port.setEnabled(False)
+            form.setRowVisible(self.port, False)
             self.channels.setEnabled(False)
+            form.labelForField(self.channels).setText("最大输入通道数")
+            hint.setText("录制时启用设备最大输入通道数，每台设备保存一个多通道文件。")
             form.addRow(label(f"系统名称：{device.system_name}\n驱动接口：{device.host_api}\n"
-                               "序列号：初版未关联 USB 硬件序列号；同名设备暂依枚举顺序区分。", "muted"))
+                               f"硬件标识：{device.hardware_id or '未取得'}\n"
+                               "同名设备尚不能可靠对应序列号，请用别名区分。", "muted"))
         scroll.setWidget(content)
         outer.addWidget(scroll)
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
@@ -191,18 +199,23 @@ class MainWindow(QMainWindow):
     def __init__(self, demo=False, config_dir: Path | None = None):
         super().__init__()
         self.demo = demo
-        self.setWindowTitle("AudioCapture Studio 0.1" + (" · 演示模式" if demo else ""))
+        self.setWindowTitle(f"AudioCapture Studio {__version__}" + (" · 演示模式" if demo else ""))
         self.resize(1220, 900)
         self.setMinimumSize(950, 760)
         self.bridge = Bridge()
         self.bridge.event.connect(self.handle_event)
         self.devices: list[Device] = []
         self.states, self.logs, self.workers = {}, {}, {}
+        self.last_levels = {}
+        self._shown_uid = None
+        self._meter_key = None
         self.active = set()
         self.session_dir = None
         self.manifest = None
         self.device_dirs = {}
         self.scan_busy = False
+        self._inventory_cache = None
+        self._inventory_signature = None
         self.started_monotonic = 0.0
         self.config_dir = config_dir or Path(os.getenv("LOCALAPPDATA", str(Path.home() / ".config"))) / "AudioCaptureStudio"
         self.config_dir.mkdir(parents=True, exist_ok=True)
@@ -210,8 +223,8 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._load()
         if demo:
-            self.devices = [Device("USB 麦克风 A", "USB", channels=8, host_api="演示", system_name="模拟 USB 输入"),
-                            Device("USB 麦克风 B", "USB", channels=4, host_api="演示", system_name="模拟 USB 输入"),
+            self.devices = [Device("USB 麦克风 A", "USB", channels=8, host_api="演示", system_name="模拟 USB 输入", bus="usb"),
+                            Device("USB 麦克风 B", "USB", channels=4, host_api="演示", system_name="模拟 USB 输入", bus="usb"),
                             Device("开发板 A", "SSH", channels=6, address="192.168.1.101", command="演示"),
                             Device("Android 测试机", "ADB", channels=8, serial="DEMO-ADB-001", command="演示")]
             for d in self.devices:
@@ -223,7 +236,7 @@ class MainWindow(QMainWindow):
         self.elapsed_timer.start(250)
         self.scan_timer = QTimer(self)
         self.scan_timer.timeout.connect(self.discover)
-        self.scan_timer.start(5000)
+        self.scan_timer.start(10000)
         if not demo:
             QTimer.singleShot(200, self.discover)
 
@@ -237,29 +250,48 @@ class MainWindow(QMainWindow):
         top.addWidget(label("AudioCapture Studio", "brand"))
         top.addWidget(label("多设备音频采集" + ("  /  演示模式" if self.demo else ""), "muted"))
         top.addStretch()
-        self.refresh_button = button("发现 USB / ADB", self.discover)
+        self.refresh_button = button("刷新设备", lambda: self.discover(force=True))
         self.add_button = button("＋ 添加远程设备", self.add_device, True)
         top.addWidget(self.refresh_button)
         top.addWidget(self.add_button)
         outer.addLayout(top)
         splitter = QSplitter(Qt.Horizontal)
+        self.splitter = splitter
+        splitter.setChildrenCollapsible(False)
         outer.addWidget(splitter, 1)
         side, side_layout = panel()
-        side.setMinimumWidth(270)
+        self.sidebar = side
+        side.setMinimumWidth(280)
+        side.setMaximumWidth(430)
         side_header = QHBoxLayout()
         side_header.addWidget(label("输入设备", "title"))
         self.count_label = label("", "muted")
         side_header.addStretch()
         side_header.addWidget(self.count_label)
         side_layout.addLayout(side_header)
+        self.source_filter = QComboBox()
+        self.source_filter.addItem("仅 USB 音频输入", "usb")
+        self.source_filter.addItem("全部本地音频输入", "all")
+        self.source_filter.setToolTip("远程设备始终显示；USB 分类来自 Windows 硬件信息。")
+        self.host_filter = QComboBox()
+        self.host_filter.addItem("自动选择驱动（优先 WASAPI）", "")
+        side_layout.addWidget(self.source_filter)
+        side_layout.addWidget(self.host_filter)
+        self.source_filter.currentIndexChanged.connect(self.filter_changed)
+        self.host_filter.currentIndexChanged.connect(self.filter_changed)
+        self.discovery_hint = label("正在查找 USB 音频设备…", "muted")
+        self.discovery_hint.setWordWrap(True)
+        side_layout.addWidget(self.discovery_hint)
         self.device_list = QListWidget()
+        self.device_list.setTextElideMode(Qt.ElideRight)
+        self.device_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.device_list.currentItemChanged.connect(self.show_current)
         self.device_list.itemChanged.connect(self.selection_changed)
         self.device_list.itemDoubleClicked.connect(lambda _: self.configure())
         side_layout.addWidget(self.device_list, 1)
         self.remove_button = button("移除选中设备", self.remove_device)
         side_layout.addWidget(self.remove_button)
-        info = label("勾选参与采集，点击查看详情。\nUSB：最大输入通道；远程：模板通道。\n录制期间新插入设备在结束后发现。", "muted")
+        info = label("☑ 勾选：参与本次录制\n蓝色高亮：仅查看设备详情\n找不到设备时可切换到全部本地音频。", "muted")
         info.setWordWrap(True)
         side_layout.addWidget(info)
         splitter.addWidget(side)
@@ -271,9 +303,10 @@ class MainWindow(QMainWindow):
         detail_layout.setSpacing(8)
         header = QHBoxLayout()
         self.device_title = label("请选择设备", "title")
+        self.device_title.setWordWrap(True)
+        self.device_title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.status_label = label("", "muted")
-        header.addWidget(self.device_title)
-        header.addStretch()
+        header.addWidget(self.device_title, 1)
         header.addWidget(self.status_label)
         detail_layout.addLayout(header)
         self.facts = label("USB 麦克风、SSH、Telnet 和 ADB 统一管理", "muted")
@@ -288,23 +321,32 @@ class MainWindow(QMainWindow):
             toolbar.addWidget(w)
         toolbar.addStretch()
         detail_layout.addLayout(toolbar)
+        self.local_hint = label("通道电平在录制时显示；选择设备不会自动开启麦克风。", "muted")
+        self.local_hint.setWordWrap(True)
+        detail_layout.addWidget(self.local_hint)
         self.meter_area = QScrollArea()
         self.meter_area.setWidgetResizable(True)
-        self.meter_area.setMinimumHeight(135)
-        self.meter_area.setMaximumHeight(135)
+        self.meter_area.setMinimumHeight(150)
         self.meter_content = QWidget()
         self.meter_content.setObjectName("meter-content")
         self.meter_content.setStyleSheet("QWidget#meter-content {background:white;}")
         self.meter_grid = QGridLayout(self.meter_content)
+        self.meter_grid.setAlignment(Qt.AlignTop)
         self.meter_area.setWidget(self.meter_content)
         self.meters = []
-        detail_layout.addWidget(self.meter_area)
+        detail_layout.addWidget(self.meter_area, 1)
+        self.log_toggle = QCheckBox("显示设备日志")
+        self.log_toggle.toggled.connect(self.update_detail_visibility)
+        detail_layout.addWidget(self.log_toggle)
         self.terminal = QPlainTextEdit()
         self.terminal.setReadOnly(True)
         self.terminal.setMinimumHeight(100)
         self.terminal.setMaximumBlockCount(4000)
+        self.terminal.setPlaceholderText("设备输出会显示在这里")
         detail_layout.addWidget(self.terminal, 1)
-        termtools = QHBoxLayout()
+        self.termtools_widget = QWidget()
+        termtools = QHBoxLayout(self.termtools_widget)
+        termtools.setContentsMargins(0, 0, 0, 0)
         self.auto_scroll = QCheckBox("自动滚动")
         self.auto_scroll.setChecked(True)
         self.search = QLineEdit()
@@ -314,8 +356,10 @@ class MainWindow(QMainWindow):
         termtools.addWidget(self.search, 1)
         termtools.addWidget(button("查找", self.find_log))
         termtools.addWidget(button("导出日志", self.export_log))
-        detail_layout.addLayout(termtools)
-        command_row = QHBoxLayout()
+        detail_layout.addWidget(self.termtools_widget)
+        self.command_widget = QWidget()
+        command_row = QHBoxLayout(self.command_widget)
+        command_row.setContentsMargins(0, 0, 0, 0)
         self.command = QLineEdit()
         self.command.setPlaceholderText("手动发送命令（发往当前设备）")
         self.command.returnPressed.connect(self.send_command)
@@ -324,7 +368,7 @@ class MainWindow(QMainWindow):
         command_row.addWidget(self.command, 1)
         command_row.addWidget(self.send_button)
         command_row.addWidget(self.interrupt_button)
-        detail_layout.addLayout(command_row)
+        detail_layout.addWidget(self.command_widget)
         right_layout.addWidget(detail, 1)
         output, output_layout = panel()
         row = QHBoxLayout()
@@ -334,17 +378,20 @@ class MainWindow(QMainWindow):
         output_layout.addLayout(row)
         self.output_label = label("每台设备独立目录：audio.wav + terminal.log", "muted")
         self.output_label.setWordWrap(True)
+        self.output_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.output_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         output_layout.addWidget(self.output_label)
         right_layout.addWidget(output)
         splitter.addWidget(right)
-        splitter.setSizes([310, 850])
+        splitter.setSizes([340, 840])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
         settings = QHBoxLayout()
         settings.addWidget(label("任务名称"))
         self.task = QLineEdit("语音采集_001")
         self.task.setMaximumWidth(210)
         settings.addWidget(self.task)
-        settings.addWidget(label("保存目录"))
+        settings.addWidget(label("保存根目录"))
         self.destination = QLineEdit(str(Path.home() / "Documents" / "AudioCapture"))
         settings.addWidget(self.destination, 1)
         self.browse_button = button("浏览…", self.browse)
@@ -356,7 +403,7 @@ class MainWindow(QMainWindow):
         transport.addWidget(self.clock)
         transport.addWidget(self.record_state)
         transport.addStretch()
-        self.start_button = button("● 全部开始", self.start_recording, True)
+        self.start_button = button("● 开始录制已勾选设备", self.start_recording, True)
         self.stop_button = button("■ 停止并取回文件", self.stop_recording)
         self.stop_button.setEnabled(False)
         transport.addWidget(self.start_button)
@@ -365,7 +412,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("独立设备时钟，统一启停不保证采样同步。" + (" 当前为演示模式。" if self.demo else ""))
         menu = self.menuBar().addMenu("帮助")
         about = QAction("关于 / 使用说明", self)
-        about.triggered.connect(lambda: QMessageBox.information(self, "AudioCapture Studio 0.1", "USB / SSH / Telnet / ADB 多设备音频采集\n\n"
+        about.triggered.connect(lambda: QMessageBox.information(self, f"AudioCapture Studio {__version__}", "USB / SSH / Telnet / ADB 多设备音频采集\n\n"
             "1. 发现设备或添加远程设备。\n2. 双击设备配置采样格式或采集模板。\n3. 远程设备先连接并确认 shell 就绪。\n4. 勾选设备，统一开始、停止。\n\n"
             "USB 使用驱动报告的最大输入通道数。\n远程只校验输出 WAV，不自动改写采集命令。\n启动命令必须前台运行，不能添加 & 或 nohup。\n"
             "USB 同名设备暂按枚举顺序区分，建议分别设置别名。\n设备密码仅在内存中保存。"))
@@ -402,15 +449,48 @@ class MainWindow(QMainWindow):
         item = self.device_list.currentItem()
         return next((d for d in self.devices if item and d.uid == item.data(Qt.UserRole)), None)
 
+    def active_host(self):
+        hosts = list(dict.fromkeys(d.host_api for d in self.devices if d.kind == "USB" and d.available))
+        return self.host_filter.currentData() or preferred_host(hosts)
+
+    def visible_devices(self):
+        host = self.active_host()
+        usb_only = self.source_filter.currentData() == "usb"
+        return [d for d in self.devices if d.kind != "USB" or (
+            d.host_api == host and not is_default_alias(d.system_name or d.name)
+            and (not usb_only or d.bus == "usb"))]
+
+    def filter_changed(self, *_):
+        if self.active:
+            return
+        visible = {d.uid for d in self.visible_devices()}
+        for d in self.devices:
+            if d.uid not in visible:
+                d.selected = False
+        self.refresh_list()
+        self.save_config()
+
+    @staticmethod
+    def device_type(d):
+        if d.kind != "USB":
+            return d.kind
+        return {"usb": "USB", "bluetooth": "蓝牙", "other": "本地音频"}.get(d.bus, "本地音频 · 类型待确认")
+
     def refresh_list(self):
         previous = self.current_device()
+        scroll = self.device_list.verticalScrollBar().value()
         self.device_list.blockSignals(True)
         self.device_list.clear()
         current_item = None
-        for d in self.devices:
+        visible = self.visible_devices()
+        for d in visible:
             state = self.states.get(d.uid, "待连接")
             identity = d.system_name if d.kind == "USB" else d.serial if d.kind == "ADB" else f"{d.address}:{d.port}"
-            item = QListWidgetItem(f"{d.name}    [{d.kind}]\n{identity}\n{d.channels} 通道  ·  {state}")
+            description = f"{d.name}\n{self.device_type(d)} · {d.channels} 通道 · {state}"
+            if d.kind != "USB":
+                description += f"\n{identity}"
+            item = QListWidgetItem(description)
+            item.setToolTip(f"{d.name}\n{identity}\n{d.host_api if d.kind == 'USB' else d.kind}")
             item.setData(Qt.UserRole, d.uid)
             item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | (Qt.ItemIsUserCheckable if not self.active else Qt.NoItemFlags))
             item.setCheckState(Qt.Checked if d.selected else Qt.Unchecked)
@@ -420,51 +500,86 @@ class MainWindow(QMainWindow):
             if previous and previous.uid == d.uid:
                 current_item = item
         self.device_list.setCurrentItem(current_item or self.device_list.item(0))
+        self.device_list.verticalScrollBar().setValue(scroll)
         self.device_list.blockSignals(False)
-        self.count_label.setText(f"{sum(d.selected for d in self.devices)} / {len(self.devices)} 台")
+        self.count_label.setText(f"勾选 {sum(d.selected for d in visible)} / {len(visible)}")
+        local_count = sum(d.kind == "USB" and d.available for d in visible)
+        self.discovery_hint.setText(
+            f"显示 {local_count} 个音频输入 · {self.active_host() or '暂无音频驱动'}"
+            if local_count else "未发现符合筛选的音频输入。可刷新，或切换到全部本地音频。")
         self.show_current()
 
     def selection_changed(self, item):
         d = next(d for d in self.devices if d.uid == item.data(Qt.UserRole))
         d.selected = item.checkState() == Qt.Checked
-        self.count_label.setText(f"{sum(d.selected for d in self.devices)} / {len(self.devices)} 台")
+        visible = self.visible_devices()
+        self.count_label.setText(f"勾选 {sum(d.selected for d in visible)} / {len(visible)}")
+        self.show_current()
         self.save_config()
+
+    def update_detail_visibility(self, *_):
+        d = self.current_device()
+        local = bool(d and d.kind == "USB")
+        remote = bool(d and not local)
+        show_log = remote or (local and self.log_toggle.isChecked())
+        self.meter_area.setVisible(local)
+        self.local_hint.setVisible(local)
+        self.log_toggle.setVisible(local)
+        self.terminal.setVisible(show_log)
+        self.termtools_widget.setVisible(show_log)
+        self.command_widget.setVisible(remote)
+        self.connect_button.setVisible(remote)
+        self.retry_button.setVisible(remote)
+        self.clear_button.setVisible(show_log)
+        self.config_button.setVisible(bool(d))
 
     def show_current(self, *_):
         d = self.current_device()
         if not d:
             self.device_title.setText("请选择设备")
+            self.status_label.setText("")
+            self.facts.setText("默认只列出已确认的 USB 音频输入。\n如果未识别，可切换左侧“全部本地音频输入”检查设备。")
             self.terminal.clear()
+            self._shown_uid = None
+            self.update_detail_visibility()
             return
-        self.device_title.setText(d.name + f"  /  {d.kind}")
-        self.status_label.setText(self.states.get(d.uid, "未连接"))
-        identity = f"{d.system_name} · {d.host_api} · 序列号未关联" if d.kind == "USB" else d.serial if d.kind == "ADB" else f"{d.address}:{d.port}"
+        changed = self._shown_uid != d.uid
+        self._shown_uid = d.uid
+        self.device_title.setText(d.name + f"  /  {self.device_type(d)}")
+        self.status_label.setText(("☑ 参与录制 · " if d.selected else "未勾选 · ") + self.states.get(d.uid, "未连接"))
+        identity = f"{d.system_name} · {d.host_api}" if d.kind == "USB" else d.serial if d.kind == "ADB" else f"{d.address}:{d.port}"
         self.facts.setText(f"{identity}\n{d.channels} 通道 · {d.rate} Hz · {d.bits} bit PCM" + (" · 最大输入通道" if d.kind == "USB" else " · 模板参数，保存时校验"))
-        self.terminal.setPlainText(self.logs.get(d.uid, ""))
-        if self.auto_scroll.isChecked():
-            self.terminal.verticalScrollBar().setValue(self.terminal.verticalScrollBar().maximum())
-        while self.meter_grid.count():
-            entry = self.meter_grid.takeAt(0)
-            widget = entry.widget()
-            if widget:
-                widget.hide()
-                widget.setParent(None)
-                widget.deleteLater()
-        self.meters = []
-        self.meter_area.setVisible(d.kind == "USB")
-        for i in range(d.channels if d.kind == "USB" else 0):
-            w = QWidget()
-            layout = QVBoxLayout(w)
-            layout.setContentsMargins(0, 0, 5, 5)
-            text = label(f"CH {i + 1:02d}   — dBFS", "muted")
-            meter = QProgressBar()
-            meter.setRange(0, 600)
-            meter.setValue(0)
-            meter.setTextVisible(False)
-            layout.addWidget(text)
-            layout.addWidget(meter)
-            self.meter_grid.addWidget(w, i // 4, i % 4)
-            self.meters.append((meter, text))
+        if changed:
+            self.terminal.setPlainText(self.logs.get(d.uid, ""))
+            if self.auto_scroll.isChecked():
+                self.terminal.verticalScrollBar().setValue(self.terminal.verticalScrollBar().maximum())
+        meter_key = (d.uid, d.channels)
+        if meter_key != self._meter_key:
+            self._meter_key = meter_key
+            while self.meter_grid.count():
+                entry = self.meter_grid.takeAt(0)
+                widget = entry.widget()
+                if widget:
+                    widget.hide()
+                    widget.setParent(None)
+                    widget.deleteLater()
+            self.meters = []
+            for i in range(d.channels if d.kind == "USB" else 0):
+                w = QWidget()
+                layout = QVBoxLayout(w)
+                layout.setContentsMargins(0, 0, 5, 12)
+                text = label(f"CH {i + 1:02d}   等待录制", "muted")
+                meter = QProgressBar()
+                meter.setRange(0, 600)
+                meter.setValue(0)
+                meter.setTextVisible(False)
+                layout.addWidget(text)
+                layout.addWidget(meter)
+                self.meter_grid.addWidget(w, i // 2, i % 2)
+                self.meters.append((meter, text))
+            self.paint_levels(d.uid)
+        self.local_hint.setText("正在显示通道峰值电平。" if d.uid in self.active else
+                                "通道电平在录制时显示；停止后保留最后一次读数。")
         remote = d.kind != "USB" and not self.demo
         worker = self.workers.get(d.uid)
         connected = isinstance(worker, RemoteWorker) and worker.connected
@@ -476,18 +591,38 @@ class MainWindow(QMainWindow):
         self.config_button.setEnabled(not self.active)
         self.retry_button.setEnabled(remote and connected and not self.active and d.uid in self.device_dirs)
         self.remove_button.setEnabled(not self.active and (not worker or not worker.is_alive()))
+        self.update_detail_visibility()
 
-    def discover(self):
+    def paint_levels(self, uid):
+        data = self.last_levels.get(uid, [])
+        for i, (meter, text) in enumerate(self.meters):
+            if i < len(data):
+                db = 20 * math.log10(max(float(data[i]), 1e-8))
+                meter.setValue(max(0, min(600, int((db + 60) * 10))))
+                text.setText(f"CH {i + 1:02d}   {db:.1f} dBFS")
+
+    def discover(self, force=False):
         if self.demo or self.active or self.scan_busy:
             return
         self.scan_busy = True
         self.refresh_button.setEnabled(False)
         self.start_button.setEnabled(False)
+        self.discovery_hint.setText("正在刷新设备及硬件信息…")
 
         def work():
-            data = {"audio": [], "adb": [], "errors": []}
+            data = {"audio": [], "adb": [], "errors": [], "audio_ok": False}
             try:
-                data["audio"] = scan_audio(reinitialize=True)
+                inputs = scan_audio(reinitialize=True)
+                data["audio_ok"] = True
+                signature = tuple((a["index"], a["name"], a["host"], a["channels"]) for a in inputs)
+                try:
+                    if force or self._inventory_cache is None or signature != self._inventory_signature:
+                        self._inventory_cache = windows_inventory()
+                        self._inventory_signature = signature
+                    data["audio"] = annotate_inputs(inputs, self._inventory_cache)
+                except Exception as exc:
+                    data["audio"] = annotate_inputs(inputs, [])
+                    data["errors"].append(f"USB 类型未确认：{exc}")
             except Exception as exc:
                 data["errors"].append(f"音频发现失败：{exc}")
             executable = next((d.adb_path for d in self.devices if d.kind == "ADB"), "adb")
@@ -504,27 +639,34 @@ class MainWindow(QMainWindow):
         self.scan_busy = False
         self.refresh_button.setEnabled(not self.active)
         self.start_button.setEnabled(not self.active)
-        # Keep distinct host APIs visible. WASAPI is preferred by default on Windows.
         old = [d for d in self.devices if d.kind == "USB"]
-        for d in old:
-            d.available = False
-            self.states[d.uid] = "已断开"
+        old_states = {d.uid: (d.available, self.states.get(d.uid)) for d in old}
+        if data.get("audio_ok", True):
+            for d in old:
+                d.available = False
+                self.states[d.uid] = "已断开"
         seen = {}
-        names_seen = set()
         for a in sorted(data["audio"], key=lambda a: ("WASAPI" not in a["host"], a["index"])):
+            if is_default_alias(a["name"]):
+                continue
             key = (a["name"], a["host"])
             ordinal = seen.get(key, 0)
             seen[key] = ordinal + 1
-            matches = [d for d in old if d.system_name == a["name"] and d.host_api == a["host"]]
+            endpoint = a.get("endpoint_id", "")
+            matches = [d for d in old if d.host_api == a["host"] and (
+                (endpoint and d.endpoint_id == endpoint) or d.system_name == a["name"])]
             if ordinal < len(matches):
                 d = matches[ordinal]
             else:
                 d = Device(a["name"], "USB", channels=a["channels"], system_name=a["name"], host_api=a["host"],
-                           selected=a["name"] not in names_seen)
+                           selected=a.get("bus") == "usb")
                 self.devices.append(d)
             d.audio_index, d.channels, d.available = a["index"], a["channels"], True
-            self.states[d.uid] = "已连接"
-            names_seen.add(a["name"])
+            d.system_name = a["name"]
+            for field in ("bus", "endpoint_id", "container_id", "hardware_id"):
+                setattr(d, field, a.get(field, "unknown" if field == "bus" else ""))
+            was_available, old_state = old_states.get(d.uid, (False, ""))
+            self.states[d.uid] = old_state if was_available and old_state in ("已保存", "部分保存 / 有异常", "异常") else "已连接"
         for serial, detail in data["adb"]:
             found = next((d for d in self.devices if d.kind == "ADB" and d.serial == serial), None)
             if not found:
@@ -532,6 +674,15 @@ class MainWindow(QMainWindow):
                 self.devices.append(found)
             if not (worker := self.workers.get(found.uid)) or not worker.is_alive():
                 self.states[found.uid] = detail
+        chosen = self.host_filter.currentData()
+        self.host_filter.blockSignals(True)
+        self.host_filter.clear()
+        self.host_filter.addItem("自动选择驱动（优先 WASAPI）", "")
+        for host in dict.fromkeys(d.host_api for d in self.devices if d.kind == "USB" and d.available):
+            self.host_filter.addItem(host, host)
+        index = self.host_filter.findData(chosen)
+        self.host_filter.setCurrentIndex(max(0, index))
+        self.host_filter.blockSignals(False)
         self.refresh_list()
         self.save_config()
         if data["errors"]:
@@ -548,7 +699,7 @@ class MainWindow(QMainWindow):
             self.states[d.uid] = "未连接"
             self.save_config()
             self.refresh_list()
-            self.device_list.setCurrentRow(len(self.devices) - 1)
+            self.device_list.setCurrentRow(self.device_list.count() - 1)
 
     def configure(self):
         d = self.current_device()
@@ -619,7 +770,7 @@ class MainWindow(QMainWindow):
     def start_recording(self):
         if self.active or self.scan_busy:
             return
-        selected = [d for d in self.devices if d.selected]
+        selected = [d for d in self.visible_devices() if d.selected]
         if not selected:
             QMessageBox.information(self, "选择设备", "请至少勾选一台设备。")
             return
@@ -682,7 +833,8 @@ class MainWindow(QMainWindow):
         self.record_state.setText("正在停止 / 取回文件…")
 
     def set_recording_ui(self, recording):
-        for widget in (self.start_button, self.add_button, self.refresh_button, self.task, self.destination, self.browse_button):
+        for widget in (self.start_button, self.add_button, self.refresh_button, self.task, self.destination,
+                       self.browse_button, self.source_filter, self.host_filter):
             widget.setEnabled(not recording)
         self.stop_button.setEnabled(recording)
         self.refresh_list()
@@ -723,13 +875,10 @@ class MainWindow(QMainWindow):
             self.append_log(uid, str(data))
             return
         if kind == "levels":
+            self.last_levels[uid] = data
             d = self.current_device()
             if d and d.uid == uid:
-                for i, (meter, text) in enumerate(self.meters):
-                    if i < len(data):
-                        db = 20 * math.log10(max(float(data[i]), 1e-8))
-                        meter.setValue(max(0, min(600, int((db + 60) * 10))))
-                        text.setText(f"CH {i + 1:02d}   {db:.1f} dBFS")
+                self.paint_levels(uid)
             return
         record = self.manifest["devices"].get(uid) if self.manifest else None
         participating = uid in self.active
@@ -752,6 +901,9 @@ class MainWindow(QMainWindow):
             self.states[uid] = "异常"
             self.append_log(uid, f"\n[{timestamp()}] 错误：{data}\n")
             self.statusBar().showMessage(str(data))
+            current = self.current_device()
+            if current and current.uid == uid and current.kind == "USB":
+                self.log_toggle.setChecked(True)
             if record and participating:
                 record.setdefault("errors", []).append({"time": timestamp(), "message": str(data)})
                 record["state"] = "异常"

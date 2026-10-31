@@ -9,6 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 from audio_capture.app import MainWindow, STYLE
+from audio_capture.models import Device
 
 
 class UiTests(unittest.TestCase):
@@ -49,6 +50,58 @@ class UiTests(unittest.TestCase):
             self.assertFalse(window.stop_button.isEnabled())
             window.close()
             self.pump(.05)
+
+    def test_only_confirmed_usb_and_one_driver_are_visible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            window = MainWindow(demo=True, config_dir=Path(tmp))
+            window.devices = []
+            raw = [
+                dict(index=0, name="USB Mic", host="Windows WASAPI", channels=8, bus="usb"),
+                dict(index=1, name="USB Mic", host="MME", channels=2, bus="usb"),
+                dict(index=2, name="Realtek", host="Windows WASAPI", channels=2, bus="other"),
+                dict(index=3, name="AirPods", host="Windows WASAPI", channels=1, bus="bluetooth"),
+                dict(index=4, name="主声音捕获驱动程序", host="Windows DirectSound", channels=2, bus="unknown"),
+            ]
+            window._discovered(dict(audio=raw, adb=[], errors=[]))
+            self.assertEqual(window.device_list.count(), 1)
+            self.assertEqual(window.current_device().channels, 8)
+            window.source_filter.setCurrentIndex(1)
+            self.assertEqual(window.device_list.count(), 3)
+            window.device_list.setCurrentRow(1)
+            self.assertNotIn("/  USB", window.device_title.text())
+            self.assertFalse(window.connect_button.isVisible())
+            # A changed index at hotplug must not lose the alias/selection.
+            usb = next(d for d in window.devices if d.system_name == "USB Mic" and d.host_api == "Windows WASAPI")
+            usb.name = "我的麦克风"
+            raw[0]["index"] = 6
+            window._discovered(dict(audio=raw, adb=[], errors=[]))
+            self.assertEqual(usb.audio_index, 6)
+            self.assertEqual(usb.name, "我的麦克风")
+            window.close()
+
+    def test_local_panel_and_remote_terminal_are_separate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            window = MainWindow(demo=True, config_dir=Path(tmp))
+            window.show()
+            self.pump(.05)
+            self.assertGreater(window.device_title.width(), 100)
+            self.assertTrue(window.meter_area.isVisible())
+            self.assertFalse(window.terminal.isVisible())
+            self.assertFalse(window.command_widget.isVisible())
+            uid = window.current_device().uid
+            window.handle_event(uid, "levels", [.1] * 8)
+            before = window.meters[0][0]
+            window.refresh_list()
+            self.assertIs(window.meters[0][0], before)
+            self.assertGreater(before.value(), 0)
+            window.resize(2400, 1200)
+            self.pump(.05)
+            self.assertLessEqual(window.sidebar.width(), 430)
+            window.device_list.setCurrentRow(2)
+            self.assertTrue(window.terminal.isVisible())
+            self.assertTrue(window.command_widget.isVisible())
+            self.assertFalse(window.meter_area.isVisible())
+            window.close()
 
 
 if __name__ == "__main__":

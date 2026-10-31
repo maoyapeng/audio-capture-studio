@@ -47,6 +47,10 @@ class Device:
     audio_index: int = -1
     system_name: str = ""
     host_api: str = ""
+    bus: str = "unknown"
+    endpoint_id: str = ""
+    container_id: str = ""
+    hardware_id: str = ""
 
     def public(self) -> dict:
         data = asdict(self)
