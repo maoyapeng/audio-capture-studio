@@ -284,6 +284,7 @@ class MainWindow(QMainWindow):
         self.source_filter.setToolTip("远程设备始终显示；USB 分类来自 Windows 硬件信息。")
         self.host_filter = QComboBox()
         self.host_filter.addItem("自动选择驱动（优先 WASAPI）", "")
+        self.host_filter.addItem("全部驱动接口（查找旧版可用输入）", "__all__")
         side_layout.addWidget(self.source_filter)
         side_layout.addWidget(self.host_filter)
         self.source_filter.currentIndexChanged.connect(self.filter_changed)
@@ -469,7 +470,7 @@ class MainWindow(QMainWindow):
         host = self.active_host()
         usb_only = self.source_filter.currentData() == "usb"
         return [d for d in self.devices if d.kind != "USB" or (
-            d.host_api == host and not is_default_alias(d.system_name or d.name)
+            (host == "__all__" or (d.host_api == host and not is_default_alias(d.system_name or d.name)))
             and (not usb_only or d.bus == "usb"))]
 
     def filter_changed(self, *_):
@@ -499,7 +500,9 @@ class MainWindow(QMainWindow):
             state = self.states.get(d.uid, "待连接")
             identity = d.system_name if d.kind == "USB" else d.serial if d.kind == "ADB" else f"{d.address}:{d.port}"
             description = f"{d.name}\n{self.device_type(d)} · {d.channels} 通道 · {state}"
-            if d.kind != "USB":
+            if d.kind == "USB":
+                description += f"\n{d.host_api}"
+            else:
                 description += f"\n{identity}"
             item = QListWidgetItem(description)
             item.setToolTip(f"{d.name}\n{identity}\n{d.host_api if d.kind == 'USB' else d.kind}")
@@ -517,7 +520,7 @@ class MainWindow(QMainWindow):
         self.count_label.setText(f"勾选 {sum(d.selected for d in visible)} / {len(visible)}")
         local_count = sum(d.kind == "USB" and d.available for d in visible)
         self.discovery_hint.setText(
-            f"显示 {local_count} 个音频输入 · {self.active_host() or '暂无音频驱动'}"
+            f"显示 {local_count} 个音频输入 · {('全部驱动接口' if self.active_host() == '__all__' else self.active_host()) or '暂无音频驱动'}"
             if local_count else "未发现符合筛选的音频输入。可刷新，或切换到全部本地音频。")
         self.show_current()
 
@@ -667,8 +670,6 @@ class MainWindow(QMainWindow):
                 self.states[d.uid] = "已断开"
         seen = {}
         for a in sorted(data["audio"], key=lambda a: ("WASAPI" not in a["host"], a["index"])):
-            if is_default_alias(a["name"]):
-                continue
             key = (a["name"], a["host"])
             ordinal = seen.get(key, 0)
             seen[key] = ordinal + 1
@@ -698,6 +699,7 @@ class MainWindow(QMainWindow):
         self.host_filter.blockSignals(True)
         self.host_filter.clear()
         self.host_filter.addItem("自动选择驱动（优先 WASAPI）", "")
+        self.host_filter.addItem("全部驱动接口（查找旧版可用输入）", "__all__")
         for host in dict.fromkeys(d.host_api for d in self.devices if d.kind == "USB" and d.available):
             self.host_filter.addItem(host, host)
         index = self.host_filter.findData(chosen)

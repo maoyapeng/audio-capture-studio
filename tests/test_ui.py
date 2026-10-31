@@ -79,6 +79,9 @@ class UiTests(unittest.TestCase):
             window._discovered(dict(audio=raw, adb=[], errors=[]))
             self.assertEqual(usb.audio_index, 6)
             self.assertEqual(usb.name, "我的麦克风")
+            window.host_filter.setCurrentIndex(window.host_filter.findData("__all__"))
+            self.assertEqual(window.device_list.count(), 5)
+            self.assertTrue(any("MME" in window.device_list.item(i).text() for i in range(5)))
             window.close()
 
     def test_local_panel_and_remote_terminal_are_separate(self):
