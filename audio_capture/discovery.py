@@ -14,7 +14,10 @@ import subprocess
 WINDOWS_INVENTORY = r"""
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$devices = @(Get-PnpDevice -PresentOnly -Class MEDIA,AudioEndpoint)
+$devices = @(Get-PnpDevice -PresentOnly -Class MEDIA,AudioEndpoint -ErrorAction SilentlyContinue -ErrorVariable queryErrors)
+foreach ($queryError in $queryErrors) {
+    if ($queryError.CategoryInfo.Category -ne 'ObjectNotFound') { throw $queryError }
+}
 $media = @($devices | Where-Object { $_.Class -eq 'MEDIA' })
 $endpoints = @($devices | Where-Object {
     $_.Class -eq 'AudioEndpoint' -and $_.InstanceId -match '\{0\.0\.1\.'
