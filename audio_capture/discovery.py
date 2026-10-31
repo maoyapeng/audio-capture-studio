@@ -58,14 +58,14 @@ ConvertTo-Json -InputObject $result -Depth 5 -Compress
 """
 
 
-def windows_inventory() -> list[dict]:
+def windows_inventory(timeout: float = 8) -> list[dict]:
     if os.name != "nt":
         return []
     encoded = base64.b64encode(WINDOWS_INVENTORY.encode("utf-16-le")).decode("ascii")
     try:
         result = subprocess.run(
         ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-            capture_output=True, timeout=8, creationflags=subprocess.CREATE_NO_WINDOW,
+            capture_output=True, timeout=timeout, creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError("Windows 硬件查询超时，仍可使用本地音频输入；点击刷新可重试") from None

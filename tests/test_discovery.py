@@ -73,9 +73,19 @@ class DiscoveryTests(unittest.TestCase):
         ]
         self.assertEqual(preferred_input_ids(devices), {d.uid for d in devices})
 
+    def test_inventory_timeout_is_configurable_without_changing_default(self):
+        from types import SimpleNamespace
+        with patch("audio_capture.discovery.os.name", "nt"), \
+             patch("audio_capture.discovery.subprocess.CREATE_NO_WINDOW", 0, create=True), \
+             patch("audio_capture.discovery.subprocess.run", return_value=SimpleNamespace(returncode=0, stdout=b"[]")) as run:
+            self.assertEqual(windows_inventory(), [])
+            self.assertEqual(run.call_args.kwargs["timeout"], 8)
+            self.assertEqual(windows_inventory(timeout=60), [])
+            self.assertEqual(run.call_args.kwargs["timeout"], 60)
+
     @unittest.skipUnless(os.name == "nt", "Windows PnP integration")
     def test_windows_inventory_command_executes(self):
-        self.assertIsInstance(windows_inventory(), list)
+        self.assertIsInstance(windows_inventory(timeout=60), list)
 
 
 if __name__ == "__main__":
