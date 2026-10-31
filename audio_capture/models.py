@@ -47,6 +47,7 @@ class Device:
     audio_index: int = -1
     system_name: str = ""
     host_api: str = ""
+    capture_mode: str = "shared"
     bus: str = "unknown"
     endpoint_id: str = ""
     container_id: str = ""

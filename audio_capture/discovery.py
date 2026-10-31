@@ -14,7 +14,7 @@ import subprocess
 WINDOWS_INVENTORY = r"""
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-$devices = @(Get-PnpDevice -PresentOnly)
+$devices = @(Get-PnpDevice -PresentOnly -Class MEDIA,AudioEndpoint)
 $media = @($devices | Where-Object { $_.Class -eq 'MEDIA' })
 $endpoints = @($devices | Where-Object {
     $_.Class -eq 'AudioEndpoint' -and $_.InstanceId -match '\{0\.0\.1\.'
@@ -57,10 +57,13 @@ def windows_inventory() -> list[dict]:
     if os.name != "nt":
         return []
     encoded = base64.b64encode(WINDOWS_INVENTORY.encode("utf-16-le")).decode("ascii")
-    result = subprocess.run(
+    try:
+        result = subprocess.run(
         ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
-        capture_output=True, timeout=25, creationflags=subprocess.CREATE_NO_WINDOW,
-    )
+            capture_output=True, timeout=8, creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Windows 硬件查询超时，仍可使用本地音频输入；点击刷新可重试") from None
     if result.returncode:
         raise RuntimeError("Windows 硬件识别失败；可切换到“全部本地音频”查看输入设备")
     inventory = json.loads(result.stdout.decode("utf-8-sig"))

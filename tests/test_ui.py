@@ -63,9 +63,11 @@ class UiTests(unittest.TestCase):
                 dict(index=4, name="主声音捕获驱动程序", host="Windows DirectSound", channels=2, bus="unknown"),
             ]
             window._discovered(dict(audio=raw, adb=[], errors=[]))
+            self.assertEqual(window.device_list.count(), 3)
+            window.source_filter.setCurrentIndex(window.source_filter.findData("usb"))
             self.assertEqual(window.device_list.count(), 1)
             self.assertEqual(window.current_device().channels, 8)
-            window.source_filter.setCurrentIndex(1)
+            window.source_filter.setCurrentIndex(window.source_filter.findData("all"))
             self.assertEqual(window.device_list.count(), 3)
             window.device_list.setCurrentRow(1)
             self.assertNotIn("/  USB", window.device_title.text())

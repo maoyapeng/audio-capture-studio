@@ -134,6 +134,12 @@ class DeviceDialog(QDialog):
         self.bits.addItems(["16", "24", "32"])
         self.bits.setCurrentText(str(defaults.bits))
         form.addRow("PCM 位深", self.bits)
+        self.capture_mode = QComboBox()
+        self.capture_mode.addItem("共享模式（兼容）", "shared")
+        self.capture_mode.addItem("WASAPI 独占（失败不回退）", "exclusive")
+        self.capture_mode.setCurrentIndex(max(0, self.capture_mode.findData(defaults.capture_mode)))
+        form.addRow("本地采集模式", self.capture_mode)
+        form.setRowVisible(self.capture_mode, bool(device and device.kind == "USB"))
         hint = label("远程命令必须以前台方式采集，并生成带正确头信息的 WAV。\n"
                      "命令中用 {remote_file} 作为路径，软件每次生成唯一远端文件名。\n"
                      "Telnet 下载地址可用 {filename} 或 {remote_file} 占位符。\n"
@@ -151,7 +157,7 @@ class DeviceDialog(QDialog):
             form.setRowVisible(self.port, False)
             self.channels.setEnabled(False)
             form.labelForField(self.channels).setText("最大输入通道数")
-            hint.setText("录制时启用设备最大输入通道数，每台设备保存一个多通道文件。")
+            hint.setText("录制时启用设备最大输入通道数。独占模式需要 WASAPI 和硬件支持所选格式；失败不会回退共享模式。\n独占可绕过系统音频引擎，但不能保证关闭设备固件或驱动内的处理。")
             form.addRow(label(f"系统名称：{device.system_name}\n驱动接口：{device.host_api}\n"
                                f"硬件标识：{device.hardware_id or '未取得'}\n"
                                "同名设备尚不能可靠对应序列号，请用别名区分。", "muted"))
@@ -192,6 +198,7 @@ class DeviceDialog(QDialog):
             value = widget.text()
             setattr(d, key, value if key == "password" else value.strip())
         d.channels, d.rate, d.bits, d.port = self.channels.value(), int(self.rate.currentText()), int(self.bits.currentText()), self.port.value()
+        d.capture_mode = self.capture_mode.currentData()
         return d
 
 
@@ -216,6 +223,8 @@ class MainWindow(QMainWindow):
         self.scan_busy = False
         self._inventory_cache = None
         self._inventory_signature = None
+        self._inventory_error = ""
+        self.discovery_snapshot = {}
         self.started_monotonic = 0.0
         self.config_dir = config_dir or Path(os.getenv("LOCALAPPDATA", str(Path.home() / ".config"))) / "AudioCaptureStudio"
         self.config_dir.mkdir(parents=True, exist_ok=True)
@@ -270,8 +279,8 @@ class MainWindow(QMainWindow):
         side_header.addWidget(self.count_label)
         side_layout.addLayout(side_header)
         self.source_filter = QComboBox()
-        self.source_filter.addItem("仅 USB 音频输入", "usb")
         self.source_filter.addItem("全部本地音频输入", "all")
+        self.source_filter.addItem("仅已确认的 USB 输入", "usb")
         self.source_filter.setToolTip("远程设备始终显示；USB 分类来自 Windows 硬件信息。")
         self.host_filter = QComboBox()
         self.host_filter.addItem("自动选择驱动（优先 WASAPI）", "")
@@ -417,6 +426,9 @@ class MainWindow(QMainWindow):
             "USB 使用驱动报告的最大输入通道数。\n远程只校验输出 WAV，不自动改写采集命令。\n启动命令必须前台运行，不能添加 & 或 nohup。\n"
             "USB 同名设备暂按枚举顺序区分，建议分别设置别名。\n设备密码仅在内存中保存。"))
         menu.addAction(about)
+        diagnostics = QAction("导出音频设备诊断", self)
+        diagnostics.triggered.connect(self.export_diagnostics)
+        menu.addAction(diagnostics)
 
     def emitter(self, uid):
         return lambda kind, data: self.bridge.event.emit(uid, kind, data)
@@ -538,7 +550,7 @@ class MainWindow(QMainWindow):
         if not d:
             self.device_title.setText("请选择设备")
             self.status_label.setText("")
-            self.facts.setText("默认只列出已确认的 USB 音频输入。\n如果未识别，可切换左侧“全部本地音频输入”检查设备。")
+            self.facts.setText("当前没有符合筛选条件的输入。\n如果未识别，可切换左侧“全部本地音频输入”检查设备。")
             self.terminal.clear()
             self._shown_uid = None
             self.update_detail_visibility()
@@ -548,7 +560,7 @@ class MainWindow(QMainWindow):
         self.device_title.setText(d.name + f"  /  {self.device_type(d)}")
         self.status_label.setText(("☑ 参与录制 · " if d.selected else "未勾选 · ") + self.states.get(d.uid, "未连接"))
         identity = f"{d.system_name} · {d.host_api}" if d.kind == "USB" else d.serial if d.kind == "ADB" else f"{d.address}:{d.port}"
-        self.facts.setText(f"{identity}\n{d.channels} 通道 · {d.rate} Hz · {d.bits} bit PCM" + (" · 最大输入通道" if d.kind == "USB" else " · 模板参数，保存时校验"))
+        self.facts.setText(f"{identity}\n{d.channels} 通道 · {d.rate} Hz · {d.bits} bit PCM" + (" · 最大输入通道 · " + ("WASAPI 独占" if d.capture_mode == "exclusive" else "共享模式") if d.kind == "USB" else " · 模板参数，保存时校验"))
         if changed:
             self.terminal.setPlainText(self.logs.get(d.uid, ""))
             if self.auto_scroll.isChecked():
@@ -617,8 +629,15 @@ class MainWindow(QMainWindow):
                 signature = tuple((a["index"], a["name"], a["host"], a["channels"]) for a in inputs)
                 try:
                     if force or self._inventory_cache is None or signature != self._inventory_signature:
-                        self._inventory_cache = windows_inventory()
+                        try:
+                            self._inventory_cache = windows_inventory()
+                            self._inventory_error = ""
+                        except Exception as exc:
+                            self._inventory_cache = []
+                            self._inventory_error = str(exc)
                         self._inventory_signature = signature
+                    if self._inventory_error:
+                        data["errors"].append(self._inventory_error)
                     data["audio"] = annotate_inputs(inputs, self._inventory_cache)
                 except Exception as exc:
                     data["audio"] = annotate_inputs(inputs, [])
@@ -636,6 +655,7 @@ class MainWindow(QMainWindow):
         threading.Thread(target=work, daemon=True).start()
 
     def _discovered(self, data):
+        self.discovery_snapshot = data
         self.scan_busy = False
         self.refresh_button.setEnabled(not self.active)
         self.start_button.setEnabled(not self.active)
@@ -659,7 +679,7 @@ class MainWindow(QMainWindow):
                 d = matches[ordinal]
             else:
                 d = Device(a["name"], "USB", channels=a["channels"], system_name=a["name"], host_api=a["host"],
-                           selected=a.get("bus") == "usb")
+                           selected=False)
                 self.devices.append(d)
             d.audio_index, d.channels, d.available = a["index"], a["channels"], True
             d.system_name = a["name"]
@@ -941,6 +961,24 @@ class MainWindow(QMainWindow):
             cursor.movePosition(cursor.MoveOperation.Start)
             self.terminal.setTextCursor(cursor)
             self.terminal.find(self.search.text())
+
+    def export_diagnostics(self):
+        path, _ = QFileDialog.getSaveFileName(self, "导出音频设备诊断", "audio-diagnostics.json", "JSON (*.json)")
+        if not path:
+            return
+        # Audio-only fields: never export remote credentials, commands or addresses.
+        data = {"version": __version__, "time": timestamp(),
+                "audio_inputs": self.discovery_snapshot.get("audio", []),
+                "hardware": self._inventory_cache or [],
+                "errors": self.discovery_snapshot.get("errors", []),
+                "host_filter": self.host_filter.currentText(),
+                "devices": [{key: getattr(d, key) for key in
+                             ("name", "system_name", "host_api", "audio_index", "channels", "rate", "bits", "capture_mode", "bus", "available")}
+                            for d in self.devices if d.kind == "USB"]}
+        try:
+            Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.warning(self, "导出失败", str(exc))
 
     def export_log(self):
         d = self.current_device()

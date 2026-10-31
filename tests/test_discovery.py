@@ -1,5 +1,7 @@
 import os
 import unittest
+import subprocess
+from unittest.mock import patch
 
 from audio_capture.discovery import annotate_inputs, is_default_alias, preferred_host, windows_inventory
 
@@ -34,6 +36,14 @@ class DiscoveryTests(unittest.TestCase):
         self.assertTrue(is_default_alias("主声音捕获驱动程序"))
         self.assertTrue(is_default_alias("Microsoft Sound Mapper - Input"))
         self.assertFalse(is_default_alias("USB 麦克风"))
+
+    def test_timeout_has_short_actionable_message(self):
+        with patch("audio_capture.discovery.os.name", "nt"), \
+             patch("audio_capture.discovery.subprocess.CREATE_NO_WINDOW", 0, create=True), \
+             patch("audio_capture.discovery.subprocess.run", side_effect=subprocess.TimeoutExpired("encoded command", 8)):
+            with self.assertRaisesRegex(RuntimeError, "硬件查询超时") as error:
+                windows_inventory()
+            self.assertNotIn("encoded", str(error.exception))
 
     @unittest.skipUnless(os.name == "nt", "Windows PnP integration")
     def test_windows_inventory_command_executes(self):

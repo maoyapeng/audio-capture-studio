@@ -52,6 +52,23 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(safe_name("CON"), "_CON")
         self.assertEqual(safe_name("a/b:c*"), "a_b_c_")
 
+    def test_exclusive_probe_and_stream_use_same_settings(self):
+        from types import SimpleNamespace
+        from audio_capture.audio import stream_options
+        settings = object()
+        calls = []
+        def wasapi(**kwargs):
+            self.assertEqual(kwargs, {"exclusive": True, "auto_convert": False})
+            return settings
+        backend = SimpleNamespace(WasapiSettings=wasapi, check_input_settings=lambda **kw: calls.append(kw))
+        d = Device("test", "USB", channels=7, host_api="Windows WASAPI", capture_mode="exclusive")
+        with patch("audio_capture.audio.sd", backend):
+            self.assertEqual(max_usable_channels(d), 7)
+            self.assertIs(calls[0]["extra_settings"], stream_options(d)["extra_settings"])
+            d.host_api = "MME"
+            with self.assertRaisesRegex(RuntimeError, "WASAPI"):
+                stream_options(d)
+
     def test_maximum_channels_is_probed(self):
         from types import SimpleNamespace
         counts = []

@@ -29,6 +29,14 @@ def scan_audio(reinitialize: bool = False) -> list[dict]:
             for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0]
 
 
+def stream_options(device: Device) -> dict:
+    if device.capture_mode == "exclusive":
+        if "WASAPI" not in device.host_api:
+            raise RuntimeError("独占采集需要选择 Windows WASAPI 驱动接口")
+        return {"extra_settings": sd.WasapiSettings(exclusive=True, auto_convert=False)}
+    return {}
+
+
 def max_usable_channels(device: Device) -> int:
     """Do not silently record fewer channels: discover and report actual maximum."""
     if sd is None:
@@ -36,7 +44,7 @@ def max_usable_channels(device: Device) -> int:
     for count in range(device.channels, 0, -1):
         try:
             sd.check_input_settings(device=device.audio_index, channels=count,
-                                    samplerate=device.rate, dtype="float32")
+                                    samplerate=device.rate, dtype="float32", **stream_options(device))
             return count
         except sd.PortAudioError:
             continue
@@ -71,7 +79,8 @@ class AudioWorker(threading.Thread):
             with sf.SoundFile(path, mode="w", samplerate=d.rate, channels=d.channels,
                               subtype=f"PCM_{d.bits}", format="RF64") as output:
                 self.emit("started", {"started_at": timestamp(), "channels": d.channels, "file": str(path)})
-                self.emit("log", "演示信号开始（非麦克风数据）" if self.demo else "正在打开音频流")
+                self.emit("log", "演示信号开始（非麦克风数据）" if self.demo else
+                          f"正在打开音频流：{d.system_name or d.name} / {d.host_api} / {d.capture_mode}；软件不做降噪、增益或混音")
                 if self.demo:
                     self._demo(output)
                 else:
@@ -126,8 +135,8 @@ class AudioWorker(threading.Thread):
 
         self.last_callback = time.monotonic()
         with sd.InputStream(device=d.audio_index, samplerate=d.rate, channels=d.channels,
-                            dtype="float32", blocksize=max(256, d.rate // 20),
-                            callback=callback) as stream:
+                            dtype="float32", blocksize=0,
+                            callback=callback, **stream_options(d)) as stream:
             self.stream = stream
             self.emit("log", f"采集中：{d.channels} 通道 / {d.rate} Hz / {d.bits} bit")
             last_meter = 0.0
