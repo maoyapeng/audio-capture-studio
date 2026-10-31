@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Build output
+build/
+dist/
+
+# Local credentials and device configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+config.local.*
+devices.local.*
+config/local/
+secrets/
+
+# Captured audio and runtime data
+recordings/
+data/
+logs/
+*.wav
+*.pcm
+*.raw
+*.flac
+*.mp3
+*.log
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
