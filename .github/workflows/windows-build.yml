@@ -41,11 +41,11 @@ jobs:
         shell: pwsh
         run: |
           Copy-Item README.md dist/AudioCaptureStudio/README.md
-          Compress-Archive -Path dist/AudioCaptureStudio -DestinationPath dist/AudioCaptureStudio-v0.1.4-Windows-x64.zip
+          Compress-Archive -Path dist/AudioCaptureStudio -DestinationPath dist/AudioCaptureStudio-v0.1.6-Windows-x64.zip
       - uses: actions/upload-artifact@v4
         with:
           name: AudioCaptureStudio-Windows-x64
-          path: dist/AudioCaptureStudio-v0.1.4-Windows-x64.zip
+          path: dist/AudioCaptureStudio-v0.1.6-Windows-x64.zip
           retention-days: 30
       - name: Publish downloadable Windows release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -56,5 +56,5 @@ jobs:
           $tag = $env:GITHUB_REF_NAME
           gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
           if ($LASTEXITCODE -eq 0) { throw "Release $tag already exists" }
-          gh release create $tag 'dist/AudioCaptureStudio-v0.1.4-Windows-x64.zip' --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title 'AudioCapture Studio 0.1.4 - Windows x64' --prerelease --notes 'Windows x64 preview. Extract the complete ZIP and run AudioCaptureStudio.exe. Includes runtime dependencies; Python is not required. Demo startup and automated tests checked in CI. Real USB and remote devices still need hardware validation. Includes pinned Platform Tools 35.0.2 ADB runtime.'
+          gh release create $tag 'dist/AudioCaptureStudio-v0.1.6-Windows-x64.zip' --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title 'AudioCapture Studio 0.1.6 - Windows x64' --prerelease --notes 'Windows x64 preview. Extract the complete ZIP and run AudioCaptureStudio.exe. Includes runtime dependencies; Python is not required. Demo startup and automated tests checked in CI. Real USB and remote devices still need hardware validation. Includes pinned Platform Tools 35.0.2 ADB runtime.'
           if ($LASTEXITCODE -ne 0) { throw 'Release upload failed' }
