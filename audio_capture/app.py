@@ -23,8 +23,8 @@ from PySide6.QtWidgets import (
 from .audio import AudioWorker, LevelTestWorker, scan_audio
 from .discovery import annotate_inputs, is_default_alias, preferred_input_ids, windows_inventory
 from . import __version__
-from .models import Device, create_session, safe_name, save_manifest, timestamp
-from .remote import RemoteWorker, adb_devices, process_options
+from .models import export_profile, import_profile, Device, create_session, safe_name, save_manifest, timestamp
+from .remote import resolve_adb, ADBMicTestWorker, RemoteWorker, adb_devices, process_options
 
 
 STYLE = """
@@ -105,7 +105,7 @@ class DeviceDialog(QDialog):
             ("name", "显示名称 / 别名"), ("address", "主机地址"),
             ("username", "登录用户名"), ("password", "密码（仅本次内存保存）"),
             ("key_file", "SSH 私钥路径（可选）"), ("fingerprint", "SSH SHA256 主机指纹"),
-            ("serial", "ADB 序列号"), ("adb_path", "adb.exe 路径或命令"),
+            ("serial", "ADB 序列号"), ("adb_path", "ADB（adb=优先内置，或自定义路径）"),
             ("command", "启动命令（前台运行）"), ("stop_command", "停止命令（空白发送 Ctrl+C）"),
             ("remote_file", "远端 WAV 文件完整路径"), ("http_url", "Telnet HTTP 文件下载地址（可选）"),
             ("encoding", "终端编码"),
@@ -431,6 +431,13 @@ class MainWindow(QMainWindow):
         transport.addWidget(self.stop_button)
         outer.addLayout(transport)
         self.statusBar().showMessage("独立设备时钟，统一启停不保证采样同步。" + (" 当前为演示模式。" if self.demo else ""))
+        config_menu = self.menuBar().addMenu("配置")
+        export_action = QAction("导出设备配置…", self)
+        export_action.triggered.connect(self.export_device_profile)
+        config_menu.addAction(export_action)
+        import_action = QAction("导入设备配置…", self)
+        import_action.triggered.connect(self.import_device_profile)
+        config_menu.addAction(import_action)
         menu = self.menuBar().addMenu("帮助")
         about = QAction("关于 / 使用说明", self)
         about.triggered.connect(lambda: QMessageBox.information(self, f"AudioCapture Studio {__version__}", "USB / SSH / Telnet / ADB 多设备音频采集\n\n"
@@ -455,6 +462,7 @@ class MainWindow(QMainWindow):
                 d.available = False if d.kind == "USB" else True
                 self.states[d.uid] = "待发现" if d.kind == "USB" else "未连接"
             self.destination.setText(data.get("destination", self.destination.text()))
+            self.task.setText(data.get("task", self.task.text()))
             self.selected_only.blockSignals(True)
             self.selected_only.setChecked(data.get("selected_only", any(d.selected for d in self.devices)))
             self.selected_only.blockSignals(False)
@@ -466,12 +474,70 @@ class MainWindow(QMainWindow):
             return
         try:
             data = {"devices": [d.public() for d in self.devices], "destination": self.destination.text(),
-                    "selected_only": self.selected_only.isChecked()}
+                    "selected_only": self.selected_only.isChecked(), "task": self.task.text()}
             temp = self.config_path.with_suffix(".tmp")
             temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
             temp.replace(self.config_path)
         except Exception as exc:
             self.statusBar().showMessage(f"配置保存失败：{exc}")
+
+    def export_device_profile(self):
+        path, _ = QFileDialog.getSaveFileName(self, "导出设备配置（不含密码和录音）", "AudioCaptureStudio-profile.json", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            data = export_profile(self.devices, self.selected_only.isChecked(), self.task.text())
+            Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            self.statusBar().showMessage("配置已导出；包含连接地址和采集命令，不包含密码、私钥内容或录音。")
+        except Exception as exc:
+            QMessageBox.warning(self, "导出失败", str(exc))
+
+    def import_device_profile(self):
+        if self.active or self.level_test is not None or self.scan_busy or any(w.is_alive() for w in self.workers.values()):
+            QMessageBox.information(self, "暂不能导入", "请先停止录制和测试，断开远程终端，并等待设备刷新结束。")
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "导入设备配置", "", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            devices, selected_only, task = import_profile(json.loads(Path(path).read_text(encoding="utf-8-sig")))
+        except Exception as exc:
+            QMessageBox.warning(self, "配置无效", str(exc))
+            return
+        answer = QMessageBox.question(self, "替换设备配置", f"将加载 {len(devices)} 台设备并替换当前设备列表。保存目录保留本机设置。\n请仅导入可信配置，连接地址和命令可能需要核对。是否继续？")
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            if not self.demo:
+                if self.config_path.exists():
+                    backup = self.config_path.with_name("devices.local.backup-" + str(time.time_ns()) + ".json")
+                    shutil.copy2(self.config_path, backup)
+                data = {"devices": [d.public() for d in devices], "destination": self.destination.text(),
+                        "selected_only": selected_only, "task": task}
+                temp = self.config_path.with_suffix(".tmp")
+                temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+                temp.replace(self.config_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "导入失败，原配置保留", str(exc))
+            return
+        self.devices = devices
+        self.workers.clear()
+        self.states = {d.uid: "待发现" if d.kind == "USB" else "未连接" for d in devices}
+        self.logs.clear()
+        self.last_levels.clear()
+        self.manifest = None
+        self.session_dir = None
+        self.device_dirs = {}
+        self.output_label.setText("各设备独立目录：audio.wav + terminal.log")
+        self.task.setText(task)
+        self.selected_only.blockSignals(True)
+        self.selected_only.setChecked(selected_only)
+        self.selected_only.blockSignals(False)
+        self.host_filter.setCurrentIndex(0)
+        self.source_filter.setCurrentIndex(0)
+        self.refresh_list()
+        self.discover(force=True)
+        self.statusBar().showMessage("配置已导入。请核对设备匹配、ADB 路径和私钥路径；密码需重新输入。")
 
     def current_device(self):
         item = self.device_list.currentItem()
@@ -576,7 +642,7 @@ class MainWindow(QMainWindow):
         local = bool(d and d.kind == "USB")
         remote = bool(d and not local)
         show_log = remote or (local and self.log_toggle.isChecked())
-        self.meter_area.setVisible(local)
+        self.meter_area.setVisible(local or bool(d and d.kind == "ADB"))
         self.local_hint.setVisible(local)
         self.log_toggle.setVisible(local)
         self.terminal.setVisible(show_log)
@@ -586,7 +652,7 @@ class MainWindow(QMainWindow):
         self.retry_button.setVisible(remote)
         self.clear_button.setVisible(show_log)
         self.config_button.setVisible(bool(d))
-        self.test_button.setVisible(local)
+        self.test_button.setVisible(local or bool(d and d.kind == "ADB"))
 
     def show_current(self, *_):
         d = self.current_device()
@@ -619,7 +685,7 @@ class MainWindow(QMainWindow):
                     widget.setParent(None)
                     widget.deleteLater()
             self.meters = []
-            for i in range(d.channels if d.kind == "USB" else 0):
+            for i in range(d.channels if d.kind in ("USB", "ADB") else 0):
                 w = QWidget()
                 layout = QVBoxLayout(w)
                 layout.setContentsMargins(0, 0, 5, 12)
@@ -638,15 +704,15 @@ class MainWindow(QMainWindow):
         remote = d.kind != "USB" and not self.demo
         worker = self.workers.get(d.uid)
         connected = isinstance(worker, RemoteWorker) and worker.connected
-        self.connect_button.setEnabled(remote and not self.active)
+        self.connect_button.setEnabled(remote and not self.active and self.level_test is None)
         self.connect_button.setText("断开终端" if connected else "连接终端")
-        self.command.setEnabled(remote and connected)
-        self.send_button.setEnabled(remote and connected)
-        self.interrupt_button.setEnabled(remote and connected)
+        self.command.setEnabled(remote and connected and self.level_test is None)
+        self.send_button.setEnabled(remote and connected and self.level_test is None)
+        self.interrupt_button.setEnabled(remote and connected and self.level_test is None)
         self.config_button.setEnabled(not self.active and self.level_test is None)
         testing = self.level_test is not None
-        self.test_button.setText("停止音量测试" if testing else "测试音量")
-        self.test_button.setEnabled(not self.active and not self.scan_busy and (testing or d.available or self.demo))
+        self.test_button.setText("测试中，请稍候…" if isinstance(self.level_test, ADBMicTestWorker) else "停止音量测试" if testing else "测试麦克风（3 秒）" if d.kind == "ADB" else "测试音量")
+        self.test_button.setEnabled(not self.active and not self.scan_busy and not isinstance(self.level_test, ADBMicTestWorker) and (testing or d.available or self.demo))
         if testing:
             self.local_hint.setText(f"正在测试：{self.level_test.device.name}（不保存音频）。选择该设备查看电平。")
         elif not self.active:
@@ -662,12 +728,15 @@ class MainWindow(QMainWindow):
             self.test_button.setText("正在停止测试…")
             return
         d = self.current_device()
-        if not d or d.kind != "USB" or self.active or self.scan_busy:
+        if not d or d.kind not in ("USB", "ADB") or self.active or self.scan_busy:
             return
         self.last_levels[d.uid] = [0.0] * d.channels
         self.paint_levels(d.uid)
-        self.level_test = LevelTestWorker(replace(d),
-            lambda kind, data, uid=d.uid: self.bridge.event.emit(uid, "test_" + kind, data), self.demo)
+        emit = lambda kind, data, uid=d.uid: self.bridge.event.emit(uid, "test_" + kind, data)
+        if d.kind == "ADB" and not self.demo:
+            self.level_test = ADBMicTestWorker(replace(d), self.config_dir / "mic-tests", emit)
+        else:
+            self.level_test = LevelTestWorker(replace(d), emit, self.demo)
         self.start_button.setEnabled(False)
         self.refresh_button.setEnabled(False)
         self.level_test.start()
@@ -714,12 +783,14 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 data["errors"].append(f"音频发现失败：{exc}")
             executable = next((d.adb_path for d in self.devices if d.kind == "ADB"), "adb")
-            if shutil.which(executable) or Path(executable).is_file():
-                try:
+            try:
+                resolved = resolve_adb(executable)
+                if shutil.which(resolved) or Path(resolved).is_file():
                     data["adb"] = adb_devices(executable)
                     data["adb_path"] = executable
-                except Exception as exc:
-                    data["errors"].append(f"ADB 发现失败：{exc}")
+                    data["adb_executable"] = resolved
+            except Exception as exc:
+                data["errors"].append(f"ADB 发现失败：{exc}")
             self.bridge.event.emit("", "discovery", data)
         threading.Thread(target=work, daemon=True).start()
 
@@ -958,7 +1029,12 @@ class MainWindow(QMainWindow):
 
     def handle_event(self, uid, kind, data):
         if kind.startswith("test_"):
-            if kind == "test_levels":
+            if kind == "test_result":
+                self.last_levels[uid] = data["levels"]
+                self.append_log(uid, data["text"] + "\n")
+                if self.current_device() and self.current_device().uid == uid:
+                    self.paint_levels(uid)
+            elif kind == "test_levels":
                 self.last_levels[uid] = data
                 if self.current_device() and self.current_device().uid == uid:
                     self.paint_levels(uid)
@@ -968,8 +1044,10 @@ class MainWindow(QMainWindow):
                     self.statusBar().showMessage(str(data))
                     self.log_toggle.setChecked(True)
             elif kind == "test_finished":
+                is_adb_test = isinstance(self.level_test, ADBMicTestWorker)
                 self.level_test = None
-                self.last_levels[uid] = [0.0] * len(self.last_levels.get(uid, []))
+                if not is_adb_test:
+                    self.last_levels[uid] = [0.0] * len(self.last_levels.get(uid, []))
                 if self.current_device() and self.current_device().uid == uid:
                     self.paint_levels(uid)
                 self.start_button.setEnabled(True)

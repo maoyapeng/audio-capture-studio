@@ -8,6 +8,7 @@ venv/
 *.egg-info/
 
 # Build output
+vendor/adb/
 build/
 dist/
 
@@ -41,3 +42,6 @@ logs/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Exported personal device profiles
+AudioCaptureStudio-profile*.json

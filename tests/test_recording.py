@@ -15,6 +15,41 @@ from audio_capture.remote import RemoteWorker
 
 
 class RecordingTests(unittest.TestCase):
+    def test_portable_profile_round_trip_and_validation(self):
+        from audio_capture.models import export_profile, import_profile
+        local = Device("array", "USB", channels=8, rate=16000, audio_index=17, system_name="Mic", host_api="MME")
+        remote = Device("board", "ADB", serial="serial", command="arecord {remote_file}", password="secret")
+        data = export_profile([local, remote], True, "task")
+        self.assertNotIn("secret", json.dumps(data))
+        restored, selected, task = import_profile(data)
+        self.assertEqual((selected, task), (True, "task"))
+        self.assertEqual(restored[0].rate, 16000)
+        self.assertEqual(restored[0].audio_index, -1)
+        self.assertFalse(restored[0].available)
+        self.assertNotEqual(restored[0].uid, local.uid)
+        self.assertEqual(restored[1].command, remote.command)
+        data["devices"][0]["channels"] = -1
+        with self.assertRaises(ValueError):
+            import_profile(data)
+        with self.assertRaises(ValueError):
+            import_profile({"format": "wrong", "version": 1})
+
+    def test_adb_terminal_arguments_support_legacy_and_modern_clients(self):
+        from types import SimpleNamespace
+        from audio_capture.remote import adb_shell_arguments, resolve_adb
+        for version, suffix in ((b"1.0.31", []), (b"1.0.41", ["-tt"])):
+            with self.subTest(version=version), patch("audio_capture.remote.subprocess.run", return_value=SimpleNamespace(returncode=0, stdout=b"Android Debug Bridge version " + version)):
+                self.assertEqual(adb_shell_arguments("adb", "array"), [resolve_adb("adb"), "-s", "array", "shell"] + suffix)
+
+    def test_bundled_adb_resolution_keeps_custom_paths(self):
+        from audio_capture.remote import resolve_adb
+        with patch("audio_capture.remote.Path.is_file", return_value=True):
+            self.assertTrue(resolve_adb("adb").endswith(str(Path("vendor/adb/adb.exe"))))
+            self.assertEqual(resolve_adb("D:/tools/adb.exe"), "D:/tools/adb.exe")
+        with patch("audio_capture.remote.Path.is_file", return_value=False), patch("audio_capture.remote.sys.frozen", True, create=True):
+            with self.assertRaisesRegex(RuntimeError, "ADB"):
+                resolve_adb("adb")
+
     def test_demo_writes_independent_multichannel_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             devices = [Device("八通道", "USB", channels=8, bits=24), Device("双通道", "USB", channels=2)]

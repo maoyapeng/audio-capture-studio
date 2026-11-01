@@ -5,6 +5,7 @@ import base64
 import codecs
 import hashlib
 import os
+import sys
 import queue
 import re
 import shlex
@@ -22,7 +23,20 @@ def process_options():
     return {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
 
 
+def resolve_adb(executable: str = "adb") -> str:
+    if executable.strip() not in ("", "adb", "adb.exe", "builtin"):
+        return executable
+    root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+    bundled = root / "vendor" / "adb" / "adb.exe"
+    if bundled.is_file():
+        return str(bundled)
+    if getattr(sys, "frozen", False) or executable == "builtin":
+        raise RuntimeError("内置 ADB 缺失，请完整解压安装包或配置自定义 adb.exe 路径")
+    return "adb"
+
+
 def adb_devices(executable: str = "adb") -> list[tuple[str, str]]:
+    executable = resolve_adb(executable)
     result = subprocess.run([executable, "devices", "-l"], capture_output=True,
                             text=True, timeout=8, **process_options())
     if result.returncode:
@@ -94,12 +108,31 @@ class SSHTransport:
         self.client.close()
 
 
+def adb_shell_arguments(executable: str, serial: str) -> list[str]:
+    executable = resolve_adb(executable)
+    result = subprocess.run([executable, "version"], capture_output=True,
+                            timeout=8, **process_options())
+    if result.returncode:
+        raise RuntimeError("无法查询 ADB 版本，请检查 adb.exe 路径")
+    match = re.search(rb"version\s+(\d+)\.(\d+)\.(\d+)", result.stdout)
+    if not match:
+        raise RuntimeError("无法识别 ADB 版本，请使用 Android Platform Tools 的 adb.exe")
+    version = tuple(int(part) for part in match.groups())
+    args = [executable, "-s", serial, "shell"]
+    # Legacy adb shell already provides a PTY; it forwards -tt to /bin/sh.
+    if version >= (1, 0, 36):
+        args.append("-tt")
+    return args
+
+
 class ADBTransport:
     def __init__(self, d: Device, emit):
         self.d = d
         if not d.serial:
             raise ValueError("请选择 ADB 序列号")
-        self.proc = subprocess.Popen([d.adb_path, "-s", d.serial, "shell", "-tt"],
+        shell_args = adb_shell_arguments(d.adb_path, d.serial)
+        emit("log", f"ADB 程序：{shell_args[0]}\n")
+        self.proc = subprocess.Popen(shell_args,
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, bufsize=0, **process_options())
         self.queue = queue.Queue()
@@ -127,7 +160,7 @@ class ADBTransport:
         self.proc.stdin.flush()
 
     def stop_command(self, command):
-        result = subprocess.run([self.d.adb_path, "-s", self.d.serial, "shell", command],
+        result = subprocess.run([resolve_adb(self.d.adb_path), "-s", self.d.serial, "shell", command],
                                 capture_output=True, timeout=10, **process_options())
         if result.returncode:
             raise RuntimeError(result.stderr.decode(self.d.encoding, errors="replace"))
@@ -135,7 +168,7 @@ class ADBTransport:
 
     def fetch(self, source, destination, emit):
         emit("state", "正在执行 adb pull")
-        result = subprocess.run([self.d.adb_path, "-s", self.d.serial, "pull", source, str(destination)],
+        result = subprocess.run([resolve_adb(self.d.adb_path), "-s", self.d.serial, "pull", source, str(destination)],
                                 capture_output=True, timeout=300, **process_options())
         if result.returncode:
             raise RuntimeError(result.stderr.decode(self.d.encoding, errors="replace"))
@@ -372,3 +405,63 @@ class RemoteWorker(threading.Thread):
                           "samplerate": info.samplerate, "returncode": returncode,
                           "duration_seconds": info.duration, "ended_at": timestamp(),
                           "verified": True})
+
+
+class ADBMicTestWorker(threading.Thread):
+    """Bounded arecord/tinycap capture, download and per-channel diagnostics."""
+    def __init__(self, device, directory, emit):
+        super().__init__(daemon=True)
+        self.device, self.directory, self.emit = device, Path(directory), emit
+
+    def stop(self):
+        # Capture has a fixed duration; allow transfer and validation to finish.
+        pass
+
+    def run(self):
+        import numpy as np
+        import soundfile as sf
+        d = self.device
+        remote = "/tmp/acs_mictest_" + uuid.uuid4().hex + ".wav"
+        try:
+            args = shlex.split(d.command)
+            if not args or PurePosixPath(args[0]).name not in ("arecord", "tinycap"):
+                raise ValueError("测试仅支持 arecord / tinycap 启动命令，请先配置设备")
+            if args.count("{remote_file}") != 1:
+                raise ValueError("启动命令必须包含独立的 {remote_file} 参数")
+            if any(token in args for token in (";", "&&", "||", "|", "&", ">", "<")):
+                raise ValueError("测试命令只支持单条录音命令")
+            tool = PurePosixPath(args[0]).name
+            duration = "-d" if tool == "arecord" else "-t"
+            if duration in args or any(a.startswith("--duration") for a in args):
+                raise ValueError("请移除启动命令中的时长参数，测试会自动录制 3 秒")
+            args = [remote if a == "{remote_file}" else a for a in args]
+            args += [duration, "3"]
+            self.emit("log", "ADB 麦克风测试：录制 3 秒，请说话或播放声源；随后下载分析。")
+            result = subprocess.run([resolve_adb(d.adb_path), "-s", d.serial, "shell", shlex.join(args)],
+                capture_output=True, timeout=20, **process_options())
+            if result.returncode:
+                raise RuntimeError((result.stdout + result.stderr).decode(d.encoding, errors="replace"))
+            self.directory.mkdir(parents=True, exist_ok=True)
+            target = self.directory / ("mic-test-" + uuid.uuid4().hex[:12] + ".wav")
+            pulled = subprocess.run([resolve_adb(d.adb_path), "-s", d.serial, "pull", remote, str(target)],
+                capture_output=True, timeout=30, **process_options())
+            if pulled.returncode:
+                raise RuntimeError((pulled.stdout + pulled.stderr).decode(d.encoding, errors="replace"))
+            info = sf.info(target)
+            if info.channels != d.channels or info.samplerate != d.rate or info.subtype != f"PCM_{d.bits}":
+                raise ValueError(f"测试文件参数不符：{info}；文件保留在 {target}")
+            if not 0 < info.duration <= 10:
+                raise ValueError("测试文件为空或时长异常")
+            samples, rate = sf.read(target, always_2d=True)
+            peak = np.max(np.abs(samples), axis=0)
+            rms = np.sqrt(np.mean(samples * samples, axis=0))
+            lines = [f"测试完成：{info.duration:.2f} 秒 / {info.channels} 通道 / {rate} Hz"]
+            for i in range(info.channels):
+                status = "无信号" if peak[i] == 0 else "接近满幅，注意削波" if peak[i] >= .999 else "信号较弱" if rms[i] < .0001 else "有信号"
+                lines.append(f"CH {i+1:02d}: 峰值 {20*np.log10(max(peak[i],1e-8)):.1f} dBFS / RMS {20*np.log10(max(rms[i],1e-8)):.1f} dBFS · {status}")
+            lines += ["参考通道可能较弱，电平不能单独判定硬件好坏。", f"本地文件：{target}", f"远端文件：{remote}"]
+            self.emit("result", {"levels": peak.tolist(), "text": "\n".join(lines), "file": str(target)})
+        except Exception as exc:
+            self.emit("error", f"ADB 麦克风测试失败：{exc}；远端测试路径：{remote}")
+        finally:
+            self.emit("finished", {})

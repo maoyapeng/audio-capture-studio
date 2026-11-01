@@ -50,7 +50,7 @@ py -3 -m venv .venv
 
 ## SSH / ADB 采集模板
 
-点击“添加远程设备”，填写连接信息、通道数、采样率、位深、启动命令和远端 WAV 路径。ADB 需安装 Android Platform Tools，并配置 `adb.exe` 路径；在设备上启用调试、允许本机授权。
+点击“添加远程设备”，填写连接信息、通道数、采样率、位深、启动命令和远端 WAV 路径。Windows 打包版内置固定版本 Platform Tools 35.0.2（ADB 1.0.41），默认 ADB 字段填 `adb` 即优先使用内置程序；也可填写外部 `adb.exe` 路径。在设备上启用调试、允许本机授权。
 
 启动命令必须**以前台方式运行**，不要添加 `&`、`nohup` 或自行转入后台。远程 shell 需支持 POSIX shell 语法。将输出文件写成 **`{remote_file}`**，不要自行给这个占位符加引号。软件会自动生成唯一远端文件名并完成 shell 引号处理，避免把上次的录音当成本次文件。
 
@@ -115,7 +115,7 @@ SSH / arecord 示例（确认声卡编号）：
 .venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-Windows 本机打包：双击 `build_windows.bat`。完成后分发整个 `dist\AudioCaptureStudio` 目录，运行其中的 `AudioCaptureStudio.exe`。ADB 工具仍需按本机配置安装。此源码包不包含已经构建好的 Windows EXE。
+Windows 本机打包：双击 `build_windows.bat`。完成后分发整个 `dist\AudioCaptureStudio` 目录，运行其中的 `AudioCaptureStudio.exe`。内置 ADB 随整个程序目录分发，请勿只复制 EXE。此源码包不包含已经构建好的 Windows EXE。
 
 上传到独立 GitHub 仓库后，也可在 Actions 中手动运行 `Windows build`，下载 Windows 应用构建产物。已提供工作流配置，本次尚未在 GitHub 上运行。
 
@@ -126,3 +126,12 @@ Windows 本机打包：双击 `build_windows.bat`。完成后分发整个 `dist\
 先用拔插变化确认设备名称，勾选目标设备，查看该设备日志是否成功保存。多通道文件应逐通道试听，避免播放器混音影响判断。如异常，通过帮助菜单导出音频设备诊断，并导出目标设备日志；诊断含本地设备名称和硬件 ID，不含远程账号密码。
 
 如果第一版能录制、新版找不到原输入：在驱动下拉框选择“全部驱动接口（查找旧版可用输入）”，该选项保留 MME / DirectSound / WASAPI 等全部输入和系统默认别名。每条输入显示驱动名称；一次只勾选一个目标设备的接口进行对比，确认可用后选择对应驱动。
+
+
+## 内置 ADB
+
+本地和 CI 打包前运行 `python scripts/prepare_adb.py`，从 Google 官方下载固定的 Windows Platform Tools 35.0.2，并校验固定 SHA-256。打包包含 adb.exe、配套 DLL、NOTICE.txt 和版本信息；下载的二进制不提交到 Git。
+
+源码运行首次准备可执行 `.venv\Scripts\python.exe scripts\prepare_adb.py`。配置中的 `adb`（或 `builtin` 强制内置）无需记录本机绝对路径；显式自定义路径优先。源码未准备内置文件时 `adb` 回退系统命令，打包版缺失内置文件则报错，避免误用未知版本。
+
+ADB 客户端仍与其他程序共用默认 ADB 服务端口，新旧服务版本冲突可能重启服务、影响现有连接。测试时应先结束其他软件的 ADB 采集；固定客户端版本不保证所有旧固件兼容。USB 驱动和设备授权仍需本机配置。

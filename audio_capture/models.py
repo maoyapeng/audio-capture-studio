@@ -79,3 +79,48 @@ def save_manifest(folder: Path, manifest: dict) -> None:
     temp = target.with_suffix(".json.tmp")
     temp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     temp.replace(target)
+
+
+def export_profile(devices: list[Device], selected_only: bool, task: str) -> dict:
+    rows = []
+    for device in devices:
+        row = device.public()
+        row["audio_index"] = -1
+        row["available"] = False
+        rows.append(row)
+    return {"format": "AudioCaptureStudio-profile", "version": 1,
+            "devices": rows, "selected_only": selected_only, "task": task}
+
+
+def import_profile(data: dict) -> tuple[list[Device], bool, str]:
+    if not isinstance(data, dict) or data.get("format") != "AudioCaptureStudio-profile" or data.get("version") != 1:
+        raise ValueError("不是支持的 AudioCapture Studio 配置文件")
+    rows = data.get("devices")
+    if not isinstance(rows, list) or len(rows) > 1000:
+        raise ValueError("设备列表格式错误或设备数量过多")
+    selected_only, task = data.get("selected_only", False), data.get("task", "语音采集_001")
+    if type(selected_only) is not bool or not isinstance(task, str):
+        raise ValueError("显示设置或任务名称格式错误")
+    devices = []
+    defaults = Device("", "USB")
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("设备配置必须是对象")
+        for key, value in row.items():
+            if key in Device.__dataclass_fields__ and key != "password" and type(value) is not type(getattr(defaults, key)):
+                raise ValueError(f"设备字段类型错误：{key}")
+        d = Device.from_dict(row)
+        if not d.name.strip() or d.kind not in ("USB", "ADB", "SSH", "Telnet"):
+            raise ValueError("设备名称或接入类型无效")
+        if not 1 <= d.channels <= 256 or not 8000 <= d.rate <= 384000 or d.bits not in (16, 24, 32):
+            raise ValueError(f"{d.name} 的音频参数无效")
+        if not 1 <= d.port <= 65535 or d.capture_mode not in ("shared", "exclusive"):
+            raise ValueError(f"{d.name} 的连接参数无效")
+        import codecs
+        codecs.lookup(d.encoding)
+        # New IDs isolate imported templates from queued events of old workers.
+        d.uid = uuid.uuid4().hex
+        d.audio_index = -1
+        d.available = d.kind != "USB"
+        devices.append(d)
+    return devices, selected_only, task
