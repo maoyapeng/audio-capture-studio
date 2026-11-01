@@ -16,7 +16,7 @@ import urllib.request
 import uuid
 from pathlib import Path, PurePosixPath
 
-from .models import Device, timestamp
+from .models import Device, timestamp, safe_name
 
 
 def process_options():
@@ -138,6 +138,25 @@ class ADBTransport:
         self.queue = queue.Queue()
         self.reader = threading.Thread(target=self._read_pipe, daemon=True)
         self.reader.start()
+        # Process creation is not proof that the remote shell is usable.
+        token = "__ACS_READY_" + uuid.uuid4().hex + "__"
+        try:
+            self.send(f"printf '\\n%s%s\\n' '{token[:8]}' '{token[8:]}'\n")
+            deadline = time.monotonic() + 12
+            received = b""
+            while time.monotonic() < deadline:
+                chunk = self.read()
+                if chunk:
+                    emit("log", chunk.decode(d.encoding, errors="replace"))
+                    received = (received + chunk)[-65536:]
+                    if token.encode("ascii") in received:
+                        break
+                time.sleep(.02)
+            else:
+                raise ConnectionError("ADB shell 就绪确认超时，请检查设备及其他 ADB 工具")
+        except Exception:
+            self.close()
+            raise
 
     def _read_pipe(self):
         try:
@@ -150,7 +169,7 @@ class ADBTransport:
         try:
             data = self.queue.get_nowait()
             if data is None:
-                raise ConnectionError("ADB shell 已断开，请检查授权和 USB 连接")
+                raise ConnectionError("ADB shell 已断开，请检查旧版 ADB 服务冲突、设备授权和 USB 连接")
             return data
         except queue.Empty:
             return b""
@@ -277,7 +296,7 @@ class RemoteWorker(threading.Thread):
             self.transport = transport_class(self.device, self.emit)
             self.connected = True
             self.emit("state", "已连接" if self.device.kind != "Telnet" else "已连接，等待登录")
-            self.emit("log", f"已连接 {self.device.name}；终端尚需确认设备 shell 已就绪")
+            self.emit("log", f"已连接 {self.device.name}；" + ("ADB shell 已确认就绪\n" if self.device.kind == "ADB" else "终端尚需确认设备 shell 已就绪\n"))
             while not self.quit.is_set():
                 data = self.transport.read()
                 if data:
@@ -380,7 +399,7 @@ class RemoteWorker(threading.Thread):
         import soundfile as sf
         self.emit("state", "取回文件中")
         temp = self.directory / "audio.download"
-        target = self.directory / "audio.wav"
+        target = self.directory / f"{safe_name(self.device.name)}.wav"
         if target.exists():
             raise RuntimeError("本次文件已存在，禁止覆盖；请在文件管理器检查")
         if self.device.kind == "Telnet":

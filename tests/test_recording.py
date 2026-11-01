@@ -68,7 +68,7 @@ class RecordingTests(unittest.TestCase):
                 worker.join(3)
                 self.assertFalse(worker.is_alive())
             for d in devices:
-                data, rate = sf.read(folder / d.uid / "audio.wav", always_2d=True)
+                data, rate = sf.read(folder / d.uid / f"{safe_name(d.name)}.wav", always_2d=True)
                 self.assertEqual(data.shape[1], d.channels)
                 self.assertEqual(rate, 48000)
                 self.assertGreater(len(data), 0)
@@ -128,7 +128,7 @@ class RecordingTests(unittest.TestCase):
                 worker.run()
             self.assertIn("error", [e[0] for e in events])
             self.assertNotIn("saved", [e[0] for e in events])
-            self.assertFalse((Path(tmp) / "audio.wav").exists())
+            self.assertFalse((Path(tmp) / "test.wav").exists())
 
     def test_input_disconnect_preserves_partial_audio(self):
         from types import SimpleNamespace
@@ -160,7 +160,7 @@ class RecordingTests(unittest.TestCase):
             self.assertIn("partial", kinds)
             self.assertIn("error", kinds)
             self.assertNotIn("saved", kinds)
-            self.assertEqual(sf.info(Path(tmp) / "audio.wav").frames, 2400)
+            self.assertEqual(sf.info(Path(tmp) / "断开设备.wav").frames, 2400)
 
     def test_stream_open_failure_never_reports_recording_started(self):
         from types import SimpleNamespace
@@ -237,7 +237,7 @@ class RemoteTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             events = self.exercise(Path(tmp), 2)
             self.assertIn("saved", [e[0] for e in events])
-            self.assertTrue((Path(tmp) / "audio.wav").is_file())
+            self.assertTrue((Path(tmp) / "远程.wav").is_file())
 
     def test_wrong_channel_file_is_not_marked_saved(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -394,7 +394,7 @@ class MainWindow(QMainWindow):
         row.addStretch()
         row.addWidget(button("打开输出目录", self.open_output))
         output_layout.addLayout(row)
-        self.output_label = label("每台设备独立目录：audio.wav + terminal.log", "muted")
+        self.output_label = label("每台设备独立目录：设备名称.wav + terminal.log", "muted")
         self.output_label.setWordWrap(True)
         self.output_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.output_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -528,7 +528,7 @@ class MainWindow(QMainWindow):
         self.manifest = None
         self.session_dir = None
         self.device_dirs = {}
-        self.output_label.setText("各设备独立目录：audio.wav + terminal.log")
+        self.output_label.setText("各设备独立目录：设备名称.wav + terminal.log")
         self.task.setText(task)
         self.selected_only.blockSignals(True)
         self.selected_only.setChecked(selected_only)

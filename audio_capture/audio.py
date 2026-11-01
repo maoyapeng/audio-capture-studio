@@ -13,7 +13,7 @@ try:
 except (OSError, ImportError):
     sd = None
 
-from .models import Device, timestamp
+from .models import Device, timestamp, safe_name
 
 
 def scan_audio(reinitialize: bool = False) -> list[dict]:
@@ -70,7 +70,7 @@ class AudioWorker(threading.Thread):
 
     def run(self):
         d = self.device
-        path = self.directory / "audio.wav"
+        path = self.directory / f"{safe_name(self.device.name)}.wav"
         try:
             if not self.demo:
                 count = max_usable_channels(d)
@@ -108,7 +108,7 @@ class AudioWorker(threading.Thread):
 
     def _emit_started(self):
         self.emit("started", {"started_at": timestamp(), "channels": self.device.channels,
-                              "file": str(self.directory / "audio.wav")})
+                              "file": str(self.directory / f"{safe_name(self.device.name)}.wav")})
 
     def _demo(self, output):
         d = self.device
