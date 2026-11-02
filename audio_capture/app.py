@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 from .audio import AudioWorker, LevelTestWorker, scan_audio
 from .discovery import annotate_inputs, is_default_alias, preferred_input_ids, windows_inventory
 from . import __version__
-from .models import export_profile, import_profile, Device, create_session, safe_name, save_manifest, timestamp
+from .models import export_profile, import_profile, Device, ManifestSaveError, create_session, safe_name, save_manifest, timestamp
 from .remote import resolve_adb, ADBMicTestWorker, RemoteWorker, adb_devices, process_options
 
 
@@ -219,6 +219,7 @@ class MainWindow(QMainWindow):
         self.active = set()
         self.level_test = None
         self.session_dir = None
+        self.manifest_save_error = ""
         self.manifest = None
         self.device_dirs = {}
         self.scan_busy = False
@@ -525,6 +526,7 @@ class MainWindow(QMainWindow):
         self.states = {d.uid: "待发现" if d.kind == "USB" else "未连接" for d in devices}
         self.logs.clear()
         self.last_levels.clear()
+        self.manifest_save_error = ""
         self.manifest = None
         self.session_dir = None
         self.device_dirs = {}
@@ -955,13 +957,11 @@ class MainWindow(QMainWindow):
             return
         try:
             self.session_dir, self.manifest = create_session(Path(self.destination.text()).expanduser(), self.task.text(), selected, self.demo)
-            self.device_dirs = {}
-            for d in selected:
-                folder = self.session_dir / f"{safe_name(d.name)}_{d.uid[:8]}"
-                folder.mkdir()
-                self.device_dirs[d.uid] = folder
-                self.manifest["devices"][d.uid]["directory"] = folder.name
-            save_manifest(self.session_dir, self.manifest)
+            self.device_dirs = {d.uid: self.session_dir / self.manifest["devices"][d.uid]["directory"] for d in selected}
+            self.manifest_save_error = ""
+        except ManifestSaveError as exc:
+            QMessageBox.critical(self, "无法保存采集信息", str(exc))
+            return
         except Exception as exc:
             QMessageBox.critical(self, "无法创建输出目录", str(exc))
             return
@@ -1106,11 +1106,17 @@ class MainWindow(QMainWindow):
         if record and (participating or kind in ("saved", "partial")):
             try:
                 save_manifest(self.session_dir, self.manifest)
+                self.manifest_save_error = ""
             except OSError as exc:
+                self.manifest_save_error = str(exc)
+                self.append_log(uid, f"\n采集信息保存失败：{exc}\n")
                 self.statusBar().showMessage(f"采集信息保存失败：{exc}")
         if not self.active and participating:
             errors = any(r.get("state") not in ("已保存",) for r in self.manifest["devices"].values())
             self.record_state.setText("已结束 · 请检查异常设备" if errors else "已完成 · 文件已保存")
+            if self.manifest_save_error:
+                self.record_state.setText("已结束 · 采集信息保存失败，请检查恢复文件")
+                QMessageBox.warning(self, "采集信息未保存完整", self.manifest_save_error)
             self.set_recording_ui(False)
         else:
             self.refresh_list()

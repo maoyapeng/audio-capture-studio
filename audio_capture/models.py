@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 import uuid
+import threading
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -70,15 +72,49 @@ def create_session(base: Path, title: str, devices: list[Device], demo: bool) ->
     manifest = {"version": 1, "created_at": timestamp(), "demo": demo,
                 "synchronization": "independent clocks; coordinated software start only",
                 "devices": {d.uid: {"device": d.public(), "state": "待启动"} for d in devices}}
+    for d in devices:
+        directory = f"{safe_name(d.name)}_{d.uid[:8]}"
+        (folder / directory).mkdir()
+        manifest["devices"][d.uid]["directory"] = directory
     save_manifest(folder, manifest)
     return folder, manifest
 
 
+class ManifestSaveError(OSError):
+    """The previous manifest remains intact; recovery_path contains the new data."""
+
+
+_manifest_lock = threading.Lock()
+
+
 def save_manifest(folder: Path, manifest: dict) -> None:
-    target = folder / "采集信息.json"
-    temp = target.with_suffix(".json.tmp")
-    temp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(target)
+    # Serialize callers and close the temporary file before Windows replacement.
+    with _manifest_lock:
+        target = folder / "采集信息.json"
+        temp = folder / f"采集信息.recovery-{time.time_ns()}-{uuid.uuid4().hex[:8]}.json"
+        payload = json.dumps(manifest, ensure_ascii=False, indent=2)
+        try:
+            with temp.open("x", encoding="utf-8") as output:
+                output.write(payload)
+        except OSError as exc:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise ManifestSaveError(f"写入采集信息失败：{target}；{exc}") from exc
+        delays = (0.05, 0.1, 0.2, 0.4)
+        for attempt in range(len(delays) + 1):
+            try:
+                temp.replace(target)
+                return
+            except OSError as exc:
+                if getattr(exc, "winerror", None) in (5, 32, 33) and attempt < len(delays):
+                    time.sleep(delays[attempt])
+                    continue
+                raise ManifestSaveError(
+                    f"替换采集信息失败（尝试 {attempt + 1} 次）：{target}；{exc}。"
+                    f"原文件未删除，新数据保留在：{temp}"
+                ) from exc
 
 
 def export_profile(devices: list[Device], selected_only: bool, task: str) -> dict:

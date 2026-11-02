@@ -4,6 +4,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import soundfile as sf
 
@@ -26,6 +27,33 @@ class UiTests(unittest.TestCase):
         while time.monotonic() < end:
             self.app.processEvents()
             time.sleep(.01)
+
+    def test_manifest_failure_blocks_start_with_accurate_message(self):
+        from audio_capture.models import ManifestSaveError
+        with tempfile.TemporaryDirectory() as tmp:
+            window = MainWindow(demo=True, config_dir=Path(tmp) / "config")
+            window.scan_timer.stop()
+            window.destination.setText(str(Path(tmp) / "recordings"))
+            with patch("audio_capture.app.create_session", side_effect=ManifestSaveError("locked")), patch("audio_capture.app.QMessageBox.critical") as dialog:
+                window.start_button.click()
+            self.assertFalse(window.active)
+            self.assertEqual(dialog.call_args.args[1], "无法保存采集信息")
+            window.close()
+
+    def test_final_manifest_failure_is_visible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            window = MainWindow(demo=True, config_dir=Path(tmp) / "config")
+            window.scan_timer.stop()
+            device = window.devices[0]
+            window.session_dir = Path(tmp)
+            window.manifest = {"devices": {device.uid: {"state": "已保存"}}}
+            window.active = {device.uid}
+            with patch("audio_capture.app.save_manifest", side_effect=OSError("recovery path")), patch("audio_capture.app.QMessageBox.warning") as dialog:
+                window.handle_event(device.uid, "finished", {})
+            self.assertFalse(window.active)
+            self.assertIn("采集信息保存失败", window.record_state.text())
+            self.assertIn("recovery path", dialog.call_args.args[2])
+            window.close()
 
     def test_demo_start_stop_and_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
