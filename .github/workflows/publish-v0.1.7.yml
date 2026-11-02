@@ -1,0 +1,41 @@
+name: Publish validated v0.1.7
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/publish-v0.1.7.yml']
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: publish-v0.1.7
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify exact successful build and publish its artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          expected=e9f94440860c9283b1f9219c4f0a3933aa8d75a2
+          run_id=41376212968
+          gh api "repos/$GH_REPO/actions/runs/$run_id" > run.json
+          jq -e --arg sha "$expected" '.head_sha == $sha and .head_branch == "main" and .event == "push" and .status == "completed" and .conclusion == "success" and .path == ".github/workflows/windows-build.yml"' run.json
+          if gh release view v0.1.7 >/dev/null 2>&1; then
+            echo "Release already exists; no changes made."
+            exit 0
+          fi
+          gh run download "$run_id" --name AudioCaptureStudio-Windows-x64 --dir artifact
+          test -f artifact/AudioCaptureStudio-v0.1.7-Windows-x64.zip
+          gh release create v0.1.7 artifact/AudioCaptureStudio-v0.1.7-Windows-x64.zip \
+            --target "$expected" \
+            --title 'AudioCapture Studio 0.1.7 - Windows x64' \
+            --prerelease \
+            --notes 'Fix Windows manifest replacement failures: save the initial manifest once, retry transient file locks, retain recovery data on failure, and show accurate errors. Windows automated tests and packaged demo startup verified. Extract the complete ZIP and run AudioCaptureStudio.exe. Real device testing is still required.'
