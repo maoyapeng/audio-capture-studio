@@ -272,6 +272,7 @@ class MainWindow(QMainWindow):
         outer.addWidget(splitter, 1)
         side, side_layout = panel()
         self.sidebar = side
+        self.side_layout = side_layout
         side.setMinimumWidth(280)
         side.setMaximumWidth(430)
         side_header = QHBoxLayout()
@@ -281,7 +282,7 @@ class MainWindow(QMainWindow):
         side_header.addWidget(self.count_label)
         side_layout.addLayout(side_header)
         self.selected_only = QCheckBox("仅显示已勾选设备（精简列表）")
-        self.selected_only.setToolTip("关闭可查找和勾选其他设备；不会删除设备或改变录音选择。")
+        self.selected_only.setToolTip("关闭后在右侧主界面查看完整设备列表；不会改变录音选择。")
         side_layout.addWidget(self.selected_only)
         self.selected_only.toggled.connect(self.filter_changed)
         self.source_filter = QComboBox()
@@ -317,6 +318,10 @@ class MainWindow(QMainWindow):
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(14)
+        self.device_browser, self.browser_layout = panel()
+        self.browser_layout.addWidget(label("输入设备 · 完整列表", "title"))
+        self.device_browser.setMinimumHeight(230)
+        right_layout.addWidget(self.device_browser, 1)
         detail, detail_layout = panel()
         detail_layout.setSpacing(8)
         header = QHBoxLayout()
@@ -591,7 +596,24 @@ class MainWindow(QMainWindow):
             return d.kind
         return {"usb": "USB", "bluetooth": "蓝牙", "other": "本地音频"}.get(d.bus, "本地音频 · 类型待确认")
 
+    def update_device_list_location(self):
+        compact = self.selected_only.isChecked()
+        target = self.side_layout if compact else self.browser_layout
+        if target.indexOf(self.device_list) < 0:
+            self.side_layout.removeWidget(self.device_list)
+            self.browser_layout.removeWidget(self.device_list)
+            if compact:
+                target.insertWidget(target.indexOf(self.remove_button), self.device_list, 1)
+            else:
+                target.addWidget(self.device_list, 1)
+            self.device_list.show()
+        self.device_browser.setVisible(not compact)
+        self.device_list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff if compact else Qt.ScrollBarAsNeeded)
+        self.device_list.setTextElideMode(Qt.ElideRight if compact else Qt.ElideNone)
+
     def refresh_list(self):
+        self.update_device_list_location()
         self.source_filter.setVisible(not self.selected_only.isChecked())
         self.host_filter.setVisible(not self.selected_only.isChecked())
         previous = self.current_device()
